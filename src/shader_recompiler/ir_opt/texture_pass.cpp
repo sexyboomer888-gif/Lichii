@@ -5,6 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdlib>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
@@ -16,6 +19,7 @@
 #include <limits>
 #include <boost/container/small_vector.hpp>
 
+#include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "shader_recompiler/byte_addressed_image.h"
@@ -945,6 +949,27 @@ TextureInst MakeInst(Environment& env, IR::Block* block, IR::Inst& inst, const H
                 if (!legacy) {
                     throw NotImplementedException("Failed to track bindless texture constant buffer (stopped at {}, budget {})",
                                                   g_handle_failure, budget);
+                }
+                static const bool trace_fallback{std::getenv("EDEN_NX2_RENDER_TRACE") != nullptr};
+                if (trace_fallback) {
+                    const auto flags{inst.Flags<IR::TextureInstInfo>()};
+                    // Counted apart so that color textures cannot use up the depth-compare lines.
+                    static std::array<std::atomic<u32>, 2> traces{};
+                    if (traces[flags.is_depth != 0 ? 1 : 0].fetch_add(1, std::memory_order_relaxed) < 256) {
+                        LOG_WARNING(Shader,
+                                    "Bindless texture fallback: start_offset={:08X} stage={} inst={} "
+                                    "is_depth={} type={} handle_failure={} cbuf_index={} "
+                                    "cbuf_offset={:08X} shift_left={} secondary_index={} "
+                                    "secondary_offset={:08X} secondary_shift_left={} "
+                                    "has_secondary={} count={} budget={}",
+                                    env.StartAddress(), static_cast<u32>(env.ShaderStage()),
+                                    inst.GetOpcode(), flags.is_depth.Value(),
+                                    static_cast<u32>(flags.type.Value()), g_handle_failure,
+                                    legacy->index, legacy->offset, legacy->shift_left,
+                                    legacy->secondary_index, legacy->secondary_offset,
+                                    legacy->secondary_shift_left, legacy->has_secondary,
+                                    legacy->count, budget);
+                    }
                 }
                 return TextureInst{.cbuf = *legacy, .inst = &inst, .block = block};
             }
