@@ -70,11 +70,11 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "writer wait", "list submit wait", "list GPU wait",
 };
 
-// Read once at startup: Enabled() runs several times per method write (no guard to check).
-inline const bool g_enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
-
+// Read on first use, after the GUI has loaded nx2_switches.txt (a static initializer runs before
+// main and would never see that file).
 inline bool Enabled() {
-    return g_enabled;
+    static const bool enabled = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
+    return enabled;
 }
 
 // Nanoseconds; from the host's own counter where the wall clock reads it directly (the zones
