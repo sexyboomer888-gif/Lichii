@@ -308,6 +308,10 @@ public:
 
     void UnbindComputeStorageBuffers();
 
+    /// EDEN_NX2_TABLE_COVERAGE: logs a pointer the shader may read that has no binding of its own
+    /// for this dispatch or draw, and whether another binding reaches it.
+    void CheckTableCoverage(bool compute, size_t stage, const Shader::Info& info, u64 shader_hash);
+
     void BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
                                   bool is_written, u32 indirect_offset = ~0U);
 

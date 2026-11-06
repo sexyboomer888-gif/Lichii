@@ -352,6 +352,7 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
                                               desc.is_written, desc.indirect_offset);
         ++ssbo_index;
     }
+    buffer_cache.CheckTableCoverage(true, 0, info, shader_hash);
 
     texture_cache.SynchronizeDescriptors(true);
 

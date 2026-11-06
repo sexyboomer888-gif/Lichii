@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <compare>
 #include <optional>
 #include <span>
 #include <vector>
@@ -168,6 +169,19 @@ struct ConstantBufferDescriptor {
     u32 count;
 
     auto operator<=>(const ConstantBufferDescriptor&) const = default;
+};
+
+/// A pointer the storage buffer pass looked at: a constant buffer slot, or an array of them with
+/// a stride, and with an indirect offset when the pointer is read from the memory the slot points
+/// to. Whether a slot gets a binding is decided once, when the pipeline is built; this is what a
+/// later check (EDEN_NX2_TABLE_COVERAGE) reads again.
+struct TablePointerProbe {
+    u32 cbuf_index;
+    u32 first;
+    u32 stride;
+    u32 indirect_offset;
+
+    auto operator<=>(const TablePointerProbe&) const = default;
 };
 
 struct StorageBufferDescriptor {
@@ -373,6 +387,7 @@ struct Info {
     boost::container::static_vector<ConstantBufferDescriptor, MAX_CBUFS>
         constant_buffer_descriptors;
     boost::container::static_vector<StorageBufferDescriptor, MAX_SSBOS> storage_buffers_descriptors;
+    boost::container::small_vector<TablePointerProbe, 4> table_probes;
     TextureBufferDescriptors texture_buffer_descriptors;
     ImageBufferDescriptors image_buffer_descriptors;
     TextureDescriptors texture_descriptors;

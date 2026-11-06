@@ -139,6 +139,10 @@ void MeshEpilogue(EmitContext& ctx) {
             if (convert_depth) {
                 ConvertDepth(ctx, vertex);
             }
+            if (Sirit::ValidId(ctx.mesh_fixed_point_size)) {
+                ctx.OpStore(ctx.OpAccessChain(ctx.output_f32, ctx.mesh_fixed_point_size, vertex),
+                            ctx.Const(ctx.runtime_info.fixed_state_point_size.value_or(1.0f)));
+            }
         };
         if (first + threads > mesh.max_vertices) {
             If(ctx, ctx.OpULessThan(ctx.U1, vertex, max_vertices), copy);
@@ -150,17 +154,26 @@ void MeshEpilogue(EmitContext& ctx) {
     for (u32 first = 0; first < mesh.max_primitives; first += threads) {
         const Id primitive{ctx.OpIAdd(ctx.U32[1], invocation, ctx.Const(first))};
         If(ctx, ctx.OpULessThan(ctx.U1, primitive, count), [&] {
-            // Vertex indices: map bytes 4 + 3 * primitive.
-            const Id byte{ctx.OpIAdd(ctx.U32[1], ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(3U)),
-                                     ctx.Const(4U))};
-            std::array<Id, 3> indices;
-            for (u32 element = 0; element < 3; ++element) {
-                const Id address{ctx.OpIAdd(ctx.U32[1], byte, ctx.Const(element))};
-                indices[element] = ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, address));
+            if (mesh.topology == 0) {
+                // A point's vertex index: map byte 4 + primitive.
+                const Id address{ctx.OpIAdd(ctx.U32[1], primitive, ctx.Const(4U))};
+                ctx.OpStore(ctx.OpAccessChain(ctx.output_u32, ctx.mesh_primitive_indices, primitive),
+                            ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, address)));
+            } else {
+                // Vertex indices: map bytes 4 + 3 * primitive.
+                const Id byte{ctx.OpIAdd(ctx.U32[1],
+                                         ctx.OpIMul(ctx.U32[1], primitive, ctx.Const(3U)),
+                                         ctx.Const(4U))};
+                std::array<Id, 3> indices;
+                for (u32 element = 0; element < 3; ++element) {
+                    const Id address{ctx.OpIAdd(ctx.U32[1], byte, ctx.Const(element))};
+                    indices[element] =
+                        ctx.OpLoad(ctx.U32[1], SharedWord(ctx, ctx.mesh_map, address));
+                }
+                const Id output_indices{ctx.TypePointer(spv::StorageClass::Output, ctx.U32[3])};
+                ctx.OpStore(ctx.OpAccessChain(output_indices, ctx.mesh_primitive_indices, primitive),
+                            ctx.OpCompositeConstruct(ctx.U32[3], std::span<const Id>(indices)));
             }
-            const Id output_indices{ctx.TypePointer(spv::StorageClass::Output, ctx.U32[3])};
-            ctx.OpStore(ctx.OpAccessChain(output_indices, ctx.mesh_primitive_indices, primitive),
-                        ctx.OpCompositeConstruct(ctx.U32[3], std::span<const Id>(indices)));
             CopyLines(ctx, primitive, ctx.mesh_primitive_base, primitive_lines,
                       ctx.mesh_primitive_targets);
         });

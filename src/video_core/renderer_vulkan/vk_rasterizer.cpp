@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <memory>
 #include <limits>
@@ -18,6 +19,7 @@
 #include <fstream>
 #include <mutex>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include <fmt/format.h>
@@ -73,6 +75,51 @@ using VideoCommon::ImageViewType;
 
 
 namespace {
+/// EDEN_NX2_MESH_COUNT_TRACE=1: the workgroup counts of each task/mesh pipeline, a frame at a time.
+/// The counts come from command lists the game's culling dispatches write, so a plant that vanishes
+/// with its draw still issued shows up as a draw with a count of zero. Logs a pipeline when its
+/// number of zero draws changes or its draws skip frames, at most 20000 lines.
+void TraceMeshCount(const std::array<u64, 3>& hashes, u32 groups, u64 frame) {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_NX2_MESH_COUNT_TRACE");
+        return value != nullptr && *value != '\0' && *value != '0';
+    }();
+    if (!enabled) {
+        return;
+    }
+    struct Entry {
+        u64 frame{~u64{0}};
+        u64 groups{};
+        u32 draws{};
+        u32 zero_draws{};
+        u32 logged_zero_draws{~0U};
+    };
+    static std::unordered_map<u64, Entry> entries;
+    static u32 lines{};
+    const u64 key = hashes[0] ^ std::rotl(hashes[1], 21) ^ std::rotl(hashes[2], 42);
+    Entry& entry = entries[key];
+    if (entry.frame != frame) {
+        const bool skipped_frames = entry.frame != ~u64{0} && frame != entry.frame + 1;
+        if (entry.frame != ~u64{0} &&
+            (entry.zero_draws != entry.logged_zero_draws || skipped_frames) && lines < 20000) {
+            ++lines;
+            LOG_INFO(Render_Vulkan,
+                     "Mesh counts: frame={} task={:016x} mesh={:016x} ps={:016x} draws={} zero={} "
+                     "groups={} next_frame={}",
+                     entry.frame, hashes[0], hashes[1], hashes[2], entry.draws, entry.zero_draws,
+                     entry.groups, frame);
+            entry.logged_zero_draws = entry.zero_draws;
+        }
+        entry.frame = frame;
+        entry.groups = 0;
+        entry.draws = 0;
+        entry.zero_draws = 0;
+    }
+    entry.groups += groups;
+    ++entry.draws;
+    entry.zero_draws += groups == 0 ? 1 : 0;
+}
+
 
 /// read_gpu_memory: the first address space (the bound channel's first) that maps the whole range,
 /// read as the GPU reads it, without flushing GPU caches.
@@ -440,6 +487,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
     }
     // Task/mesh pipelines: the draw's vertex count is the number of task workgroups.
     mesh_draw = pipeline->IsMeshPipeline();
+    if (mesh_draw) {
+        const auto& hashes = pipeline->ShaderHashes();
+        mesh_trace_hashes = {hashes[0], hashes[1], hashes[5]};
+    }
     // EDEN_NX2_NO_MESH=1: skip task/mesh draws as before they were supported (A/B comparisons).
     // EDEN_NX2_NO_MESH_FILE=<path>: skip them while that file exists (checked every 1024 draws),
     // to compare the same scene with and without them in one run.
@@ -805,6 +856,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         }
 
         if (mesh_draw) {
+            TraceMeshCount(mesh_trace_hashes, draw_params.num_vertices, render_trace_frame);
             scheduler.Record([this, groups = draw_params.num_vertices](vk::CommandBuffer cmdbuf) {
                 if (scheduler.GraphicsPipelineMissing()) {
                     return;

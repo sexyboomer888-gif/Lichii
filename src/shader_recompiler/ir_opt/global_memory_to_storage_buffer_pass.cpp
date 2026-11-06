@@ -7,12 +7,14 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <optional>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include <boost/container/flat_set.hpp>
 #include <boost/container/small_vector.hpp>
@@ -87,7 +89,40 @@ struct StorageInfo {
     size_t table_budget{};
     size_t table_used{};
     small_vector<StorageBufferAddr, 8> table_candidates;
+    /// EDEN_NX2_TABLE_ALL_SLOTS: slots of a pointer array that were empty when the pipeline was
+    /// built bind too, in what the rest leaves free. Slots fill in later (a plant type that first
+    /// loads in another area) and a slot without a binding has no buffer to read from.
+    bool empty_slots_enabled{};
+    size_t empty_slot_budget{};
+    size_t empty_slots_used{};
+    small_vector<StorageBufferAddr, 8> empty_slot_candidates;
+    bool saw_pointer_array{};
+    bool budget_logged{};
+    small_vector<TablePointerProbe, 4> table_probes;
 };
+
+bool EnvFlag(const char* name) {
+    const char* const value{std::getenv(name)};
+    return value != nullptr && *value != '\0' && *value != '0';
+}
+
+void AddTableProbe(StorageInfo& info, u32 index, u32 first, u32 stride, u32 indirect) {
+    const TablePointerProbe probe{index, first, stride, indirect};
+    if (std::ranges::find(info.table_probes, probe) == info.table_probes.end()) {
+        info.table_probes.push_back(probe);
+    }
+    info.saw_pointer_array |= stride != 0;
+}
+
+void NoteEmptySlot(StorageInfo& info, const StorageBufferAddr& pointer) {
+    if (std::ranges::find(info.empty_slot_candidates, pointer) ==
+        info.empty_slot_candidates.end()) {
+        info.empty_slot_candidates.push_back(pointer);
+    }
+    if (std::ranges::find(info.table_candidates, pointer) == info.table_candidates.end()) {
+        info.table_candidates.push_back(pointer);
+    }
+}
 
 /// Returns true when the instruction is a global memory instruction
 bool IsGlobalMemory(const IR::Inst& inst) {
@@ -1120,12 +1155,19 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                 std::unordered_set<const IR::Inst*> slot_visited;
                 CollectPointerSlots(offset, slots, slot_visited);
                 for (const auto& [first, stride] : slots) {
+                    AddTableProbe(info, index.U32(), first, stride, ~0U);
                     for (u32 slot = 0; slot < (stride ? max_slots : 1U); ++slot) {
                         const StorageBufferAddr pointer{.index = index.U32(),
                                                         .offset = first + slot * stride};
-                        if (Common::IsAligned(pointer.offset, 8) &&
-                            std::ranges::find(candidates, pointer) == candidates.end() &&
-                            env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)) {
+                        if (!Common::IsAligned(pointer.offset, 8) ||
+                            std::ranges::find(candidates, pointer) != candidates.end()) {
+                            continue;
+                        }
+                        if (env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)) {
+                            candidates.push_back(pointer);
+                            dynamic = true;
+                        } else if (info.empty_slots_enabled && stride != 0) {
+                            NoteEmptySlot(info, pointer);
                             candidates.push_back(pointer);
                             dynamic = true;
                         }
@@ -1260,6 +1302,7 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                 if (holder->Arg(1).IsImmediate()) {
                     const StorageBufferAddr pointer{
                         .index = index, .offset = holder->Arg(1).U32(), .indirect = indirect};
+                    AddTableProbe(info, pointer.index, pointer.offset, 0, pointer.indirect);
                     if (Common::IsAligned(pointer.offset, 8) &&
                         env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)) {
                         add(pointer, via_phi || !holder_addr);
@@ -1271,12 +1314,18 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                 std::unordered_set<const IR::Inst*> slot_visited;
                 CollectPointerSlots(holder->Arg(1), slots, slot_visited);
                 for (const auto& [first, stride] : slots) {
+                    AddTableProbe(info, index, first, stride, indirect);
                     for (u32 slot = 0; slot < (stride ? max_slots : 1U); ++slot) {
                         const StorageBufferAddr pointer{
                             .index = index, .offset = first + slot * stride, .indirect = indirect};
-                        if (Common::IsAligned(pointer.offset, 8) &&
-                            env.IsCbufIndirectStorageBufferPointer(pointer.index, pointer.offset,
+                        if (!Common::IsAligned(pointer.offset, 8)) {
+                            continue;
+                        }
+                        if (env.IsCbufIndirectStorageBufferPointer(pointer.index, pointer.offset,
                                                                    pointer.indirect)) {
+                            add(pointer, true);
+                        } else if (info.empty_slots_enabled && stride != 0) {
+                            NoteEmptySlot(info, pointer);
                             add(pointer, true);
                         }
                     }
@@ -1316,6 +1365,7 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
     const bool native = env.IsNativeProgram();
     if (native && storage_buffer &&
         !env.IsCbufStorageBufferPointer(storage_buffer->index, storage_buffer->offset)) {
+        AddTableProbe(info, storage_buffer->index, storage_buffer->offset, 0, ~0U);
         storage_buffer.reset();
     }
     if (native && !storage_buffer && !low_addr.IsImmediate()) {
@@ -1345,10 +1395,25 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
                         (candidate.indirect != ~0U && info.set.find(holder) == info.set.end()
                              ? 1U
                              : 0U)};
-                    if (info.table_used + added > info.table_budget) {
+                    const bool empty_slot{std::ranges::find(info.empty_slot_candidates, candidate) !=
+                                          info.empty_slot_candidates.end()};
+                    if (empty_slot ? info.empty_slots_used + added > info.empty_slot_budget
+                                   : info.table_used + added > info.table_budget) {
+                        static const bool trace{EnvFlag("EDEN_NX2_TABLE_COVERAGE")};
+                        if (trace && !empty_slot && !std::exchange(info.budget_logged, true)) {
+                            LOG_WARNING(Shader,
+                                        "Table coverage: program {:#x} is out of storage buffers "
+                                        "at c{}[{:#x}]+{:#x} ({} used, budget {})",
+                                        env.StartAddress(), candidate.index, candidate.offset,
+                                        candidate.indirect, info.table_used, info.table_budget);
+                        }
                         continue;
                     }
-                    info.table_used += added;
+                    // The descriptors are a fixed array.
+                    if (info.set.size() + added > Info::MAX_SSBOS) {
+                        continue;
+                    }
+                    (empty_slot ? info.empty_slots_used : info.table_used) += added;
                 }
                 info.set.insert(candidate);
                 if (IsGlobalMemoryWrite(inst)) {
@@ -1587,6 +1652,22 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         info = std::move(with_tables);
         collect();
     }
+    static const bool bind_empty_slots{EnvFlag("EDEN_NX2_TABLE_ALL_SLOTS")};
+    if (bind_empty_slots && info.saw_pointer_array && env.ShaderStage() == Stage::Compute &&
+        info.set.size() < Info::MAX_SSBOS) {
+        // Once more with the empty slots, in the bindings the mapped ones leave free.
+        StorageInfo with_empty;
+        with_empty.iterator_words = std::move(info.iterator_words);
+        with_empty.atomic_pointers = std::move(info.atomic_pointers);
+        with_empty.tables_enabled = true;
+        with_empty.table_budget =
+            info.tables_enabled ? info.table_budget : Info::MAX_SSBOS - info.set.size();
+        with_empty.empty_slots_enabled = true;
+        with_empty.empty_slot_budget = Info::MAX_SSBOS - info.set.size();
+        info = std::move(with_empty);
+        collect();
+    }
+    program.info.table_probes = info.table_probes;
     program.info.native_global_bounds |= info.native_runtime_bounds;
     for (const StorageBufferAddr& storage_buffer : info.set) {
         program.info.storage_buffers_descriptors.push_back({
