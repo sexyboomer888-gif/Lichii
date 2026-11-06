@@ -1,0 +1,40 @@
+name: apply-integration
+
+on:
+  push:
+    branches:
+      - ci/apply
+    paths:
+      - .github/workflows/apply-integration.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ci
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/oot-88
+          path: repo
+          fetch-depth: 0
+      - name: Merge the upstream pull requests and apply the patch
+        working-directory: repo
+        run: |
+          set -eux
+          git config user.name "github-actions[bot]"
+          git config user.email "41898732+github-actions[bot]@users.noreply.github.com"
+          test "$(git rev-parse HEAD)" = 6f33220a8037102fa6af4038797de85976b6defd
+          upstream=https://github.com/zortos293/lichii
+          git fetch "$upstream" 5dbaa3230e2c1fc4f3836f166375de04adfb3801
+          git merge -X theirs --no-ff -m "Merge upstream PR #267 (Ocarina of Time: sun, white foliage, report waits)" FETCH_HEAD
+          git fetch "$upstream" 03c3aa3d60104de19107b0378d7f064e21bf6952
+          git cherry-pick -x FETCH_HEAD
+          base64 -d ../ci/integration.patch.xz.b64 | xz -d > "$RUNNER_TEMP/integration.patch"
+          git am -C2 --keep-cr "$RUNNER_TEMP/integration.patch"
+          test "$(git rev-parse 'HEAD^{tree}')" = c08845acbd37c27731faea02268fa99c19863b54
+          git push origin HEAD:fix/oot-88
