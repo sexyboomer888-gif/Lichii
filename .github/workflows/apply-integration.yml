@@ -33,8 +33,11 @@ jobs:
           upstream=https://github.com/zortos293/lichii
           git fetch "$upstream" 588bfa611be9853729682dd78416c66e8d56385a
           git merge --no-ff -m "Merge upstream nx2 (588bfa61): compute write ordering and misaligned SSBO accesses (#295), AV1 in MinGW (#284), ThreadWorker wake (#290)" FETCH_HEAD
-          test "$(git rev-parse 'HEAD^{tree}')" = b5c2cb57fdccaef96dff8628a0eef5b2d3a57470
+          # The token can't push workflow changes: keep this fork's workflow files.
+          git checkout HEAD^1 -- .github
+          git commit --amend --no-edit
+          test "$(git rev-parse 'HEAD^{tree}')" = e4daa84c86344f076a0c21dc45df48c358e70e46
           base64 -d ../ci/series20.patch.xz.b64 | xz -d > "$RUNNER_TEMP/series20.patch"
           git am -C2 --keep-cr "$RUNNER_TEMP/series20.patch"
-          test "$(git rev-parse 'HEAD^{tree}')" = 9ed85e5954d3ec21811351509f02a746d64a4d8f
+          test "$(git rev-parse 'HEAD^{tree}')" = 1ac049bae6b6bd75202a8e8dc13ef1b7de2050f1
           git push origin HEAD:fix/oot-88
