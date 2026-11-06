@@ -461,6 +461,7 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     Optimization::CollectShaderInfoPass(env, program);
     program.info.is_task = program.stage == Stage::Task;
     program.info.is_mesh = program.stage == Stage::Mesh;
+    program.info.is_mesh_points = program.stage == Stage::Mesh && program.mesh.topology == 0;
     if (program.stage == Stage::Mesh) {
         // Its outputs come from the stage buffer lines, not attribute stores; the next stage
         // reads what they name.
