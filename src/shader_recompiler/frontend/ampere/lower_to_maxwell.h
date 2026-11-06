@@ -311,6 +311,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 requires_shadow = true;
         }
         if (requires_shadow) {
+            // Shadowing borrows aligned quartets: lower again with an aligned mirror base.
+            if (uses_uniform_bank && (high_uniform_base & 3))
+                result.high_uniform_registers =
+                    (std::max)(result.high_uniform_registers, (high_uniforms + 3) & ~3U);
             if (!uses_uniform_bank || (high_uniform_base & 3))
                 return fail(index, "native program uses lowering scratch registers");
             pressure = PrepareRegisterPressure(insn, high_uniform_base);
