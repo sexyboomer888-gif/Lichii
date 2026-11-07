@@ -118,6 +118,12 @@ struct GPU::Impl {
         }
     }
 
+    void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
+        for (auto& manager : system.GetGPUDirtyMemoryManager()) {
+            manager.ForEachPending(callback);
+        }
+    }
+
     /// Signal the ending of command list.
     void OnCommandListEnd() {
         renderer->ReadRasterizer()->ReleaseFences(false);
@@ -425,12 +431,6 @@ void GPU::InvalidateGPUCache() {
     impl->InvalidateGPUCache();
 }
 
-void GPU::ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
-    for (auto& manager : impl->system.GetGPUDirtyMemoryManager()) {
-        manager.ForEachPending(callback);
-    }
-}
-
 bool GPU::HasPendingCPUWrites(DAddr addr, u64 size) {
     for (auto& manager : impl->system.GetGPUDirtyMemoryManager()) {
         if (manager.Overlaps(addr, size)) {
@@ -438,6 +438,10 @@ bool GPU::HasPendingCPUWrites(DAddr addr, u64 size) {
         }
     }
     return false;
+}
+
+void GPU::ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
+    impl->ForEachPendingCpuWrite(callback);
 }
 
 void GPU::OnCommandListEnd() {

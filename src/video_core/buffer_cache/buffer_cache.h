@@ -31,47 +31,6 @@
 
 namespace VideoCommon {
 
-namespace Nx2StorageBuffers {
-inline bool EnvFlag(const char* name) {
-    const char* const value = std::getenv(name);
-    return value != nullptr && *value != '\0' && *value != '0';
-}
-
-inline bool CoverageEnabled() {
-    static const bool enabled = EnvFlag("EDEN_NX2_TABLE_COVERAGE");
-    return enabled;
-}
-
-/// Bound size of a native pointer whose real size is unknown, and of a written table pool.
-/// EDEN_NX2_SSBO_CAP_MIB changes it (default 8): reads past the binding return 0, and a write marks
-/// the whole binding GPU-modified.
-inline u64 PointerCap() {
-    static const u64 cap = [] {
-        const char* const value = std::getenv("EDEN_NX2_SSBO_CAP_MIB");
-        const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
-        return (mib == 0 ? u64{8} : (std::min)(mib, u64{1024})) * 1024 * 1024;
-    }();
-    return cap;
-}
-
-/// Logs each pointer once, its first time, when a binding stops short of the mapping behind it.
-inline void NoteCappedBinding(GPUVAddr address, u64 mapping, u64 bound, bool is_written,
-                              bool native_pointer, bool table_pointer) {
-    if (bound >= mapping) {
-        return;
-    }
-    static std::mutex mutex;
-    static std::unordered_set<GPUVAddr> seen;
-    std::scoped_lock lock{mutex};
-    if (seen.size() < 2000 && seen.insert(address).second) {
-        LOG_WARNING(HW_GPU,
-                    "Table coverage: binding of {:#x} stops at {:#x} of {:#x} mapped (written={} "
-                    "native={} table={})",
-                    address, bound, mapping, is_written, native_pointer, table_pointer);
-    }
-}
-} // namespace Nx2StorageBuffers
-
 using Core::DEVICE_PAGESIZE;
 
 template <class P>
@@ -428,6 +387,7 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
         if (staged.empty() && mapped.empty()) {
             return;
         }
+        const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
         if (staged.empty()) {
             if constexpr (has_mapped) {
                 runtime.FinishForHostRead();
@@ -446,7 +406,8 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
                 runtime.Finish();
             }
             for (const Download& download : staged) {
-                device_memory.WriteBlockUnsafe(
+                WriteDownloadedMemory(
+                    cpu_written,
                     slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset,
                     staging.mapped_span.data() + (download.copy.dst_offset - staging.offset),
                     download.copy.size);
@@ -455,9 +416,9 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
         if constexpr (has_mapped) {
             for (const Download& download : mapped) {
                 Buffer& buffer = slot_buffers[download.buffer_id];
-                device_memory.WriteBlockUnsafe(buffer.CpuAddr() + download.copy.src_offset,
-                                               buffer.Mapped().data() + download.copy.src_offset,
-                                               download.copy.size);
+                WriteDownloadedMemory(cpu_written, buffer.CpuAddr() + download.copy.src_offset,
+                                      buffer.Mapped().data() + download.copy.src_offset,
+                                      download.copy.size);
             }
         }
     }
@@ -759,8 +720,8 @@ bool BufferCache<P>::BindGraphicsStorageBuffer(size_t stage, size_t ssbo_index, 
             }
         }
     }
-    channel_state->enabled_storage_buffers[stage] |= 1U << ssbo_index;
-    channel_state->written_storage_buffers[stage] |= (is_written ? 1U : 0U) << ssbo_index;
+    channel_state->enabled_storage_buffers[stage] |= u64{1} << ssbo_index;
+    channel_state->written_storage_buffers[stage] |= u64{is_written ? 1U : 0U} << ssbo_index;
     if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
         if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
             ++channel_state->total_graphics_storage_buffers;
@@ -848,8 +809,8 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
             }
         }
     }
-    channel_state->enabled_compute_storage_buffers |= 1U << ssbo_index;
-    channel_state->written_compute_storage_buffers |= (is_written ? 1U : 0U) << ssbo_index;
+    channel_state->enabled_compute_storage_buffers |= u64{1} << ssbo_index;
+    channel_state->written_compute_storage_buffers |= u64{is_written ? 1U : 0U} << ssbo_index;
     if constexpr (requires { runtime.ShouldLimitDynamicStorageBuffers(); }) {
         if (runtime.ShouldLimitDynamicStorageBuffers() && !already_enabled) {
             ++channel_state->total_compute_storage_buffers;
@@ -874,13 +835,9 @@ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index,
         }
         ssbo_addr = holder + indirect_offset;
     }
-    // EDEN_NX2_SSBO_SIZE_WORD=1: take the word after a native pointer as its size when it can be one
-    // (so a written pool marks less memory GPU-modified), as Eglantine does outside DLSS passes.
-    static const bool size_word = Nx2StorageBuffers::EnvFlag("EDEN_NX2_SSBO_SIZE_WORD");
     channel_state->compute_storage_buffers[ssbo_index] =
-        StorageBufferBinding(ssbo_addr, cbuf_index, is_written,
-                             kepler_compute->IsNativeMode() && !size_word, indirect_offset != ~0U,
-                             true);
+        StorageBufferBinding(ssbo_addr, cbuf_index, is_written, kepler_compute->IsNativeMode(),
+                             indirect_offset != ~0U, true);
     if (indirect_offset != ~0U) {
         TraceTablePointer(true, 0, ssbo_index, cbuf_index, cbuf_offset, indirect_offset, holder,
                           channel_state->compute_storage_buffers[ssbo_index]);
@@ -2783,9 +2740,10 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
     const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
     for (const Download& download : downloads) {
         const DAddr device_addr = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
-        WriteDownloadedMemory(cpu_written, device_addr,
-                              mapped_memory + (download.copy.dst_offset - download_staging.offset),
-                              download.copy.size);
+        WriteDownloadedMemory(
+            cpu_written, device_addr,
+            mapped_memory + (download.copy.dst_offset - download_staging.offset),
+            download.copy.size);
     }
 }
 
@@ -2979,109 +2937,6 @@ void BufferCache<P>::TraceTablePointer(bool compute, size_t stage, size_t ssbo_i
 }
 
 template <class P>
-void BufferCache<P>::CheckTableCoverage(bool compute, size_t stage, const Shader::Info& info,
-                                        u64 shader_hash) {
-    // Which slots of a pointer table get a binding is decided when the pipeline is built, from what
-    // the slots held then, and the decision goes to the disk cache with it. The table can change
-    // later. A shader reads an address from the bound buffer with the closest base below it, so a
-    // pointer with no binding only works if that buffer happens to reach it.
-    if (!Nx2StorageBuffers::CoverageEnabled() || info.table_probes.empty()) {
-        return;
-    }
-    const auto cbuf_range = [&](u32 index) -> std::pair<GPUVAddr, u32> {
-        if (compute) {
-            const auto& launch = kepler_compute->launch_description;
-            if (index >= launch.const_buffer_config.size() ||
-                ((launch.const_buffer_enable_mask >> index) & 1) == 0) {
-                return {};
-            }
-            return {launch.const_buffer_config[index].Address(),
-                    static_cast<u32>(launch.const_buffer_config[index].size)};
-        }
-        const auto& cbufs = maxwell3d->state.shader_stages[stage].const_buffers;
-        if (index >= cbufs.size() || !cbufs[index].enabled) {
-            return {};
-        }
-        return {cbufs[index].address, cbufs[index].size};
-    };
-    const auto read_pointer = [&](GPUVAddr address) -> GPUVAddr {
-        return gpu_memory->IsFullyMappedRange(address, sizeof(u64)) ? gpu_memory->Read<u64>(address)
-                                                                    : 0;
-    };
-    const auto pointer_at = [&](u32 index, u32 offset, u32 indirect) -> GPUVAddr {
-        const auto [base, size] = cbuf_range(index);
-        if (base == 0 || offset + sizeof(u64) > size) {
-            return 0;
-        }
-        const GPUVAddr slot = read_pointer(base + offset);
-        if (indirect == ~0U || slot == 0) {
-            return slot;
-        }
-        return read_pointer(slot + indirect);
-    };
-    boost::container::small_vector<GPUVAddr, 32> bases;
-    for (const auto& desc : info.storage_buffers_descriptors) {
-        bases.push_back(pointer_at(desc.cbuf_index, desc.cbuf_offset, desc.indirect_offset));
-    }
-    static std::mutex coverage_mutex;
-    static std::unordered_set<u64> seen;
-    std::scoped_lock coverage_lock{coverage_mutex};
-    for (const Shader::TablePointerProbe& probe : info.table_probes) {
-        // Twice the slots the shader pass looks at, to see tables that go on past its limit.
-        const u32 slots = probe.stride != 0 ? 32 : 1;
-        for (u32 slot = 0; slot < slots; ++slot) {
-            const u32 offset = probe.first + slot * probe.stride;
-            const GPUVAddr entry = pointer_at(probe.cbuf_index, offset, probe.indirect_offset);
-            if (entry == 0 || !gpu_memory->IsWithinGPUAddressRange(entry) ||
-                !gpu_memory->IsFullyMappedRange(entry, 1)) {
-                continue;
-            }
-            size_t bound_index = bases.size();
-            size_t closest = bases.size();
-            for (size_t index = 0; index < bases.size(); ++index) {
-                const auto& desc = info.storage_buffers_descriptors[index];
-                if (desc.cbuf_index == probe.cbuf_index && desc.cbuf_offset == offset &&
-                    desc.indirect_offset == probe.indirect_offset) {
-                    bound_index = index;
-                }
-                if (bases[index] != 0 && bases[index] <= entry &&
-                    (closest == bases.size() || bases[index] > bases[closest])) {
-                    closest = index;
-                }
-            }
-            if (bound_index != bases.size()) {
-                continue;
-            }
-            bool reached = false;
-            u64 reach = 0;
-            if (closest != bases.size()) {
-                const auto& desc = info.storage_buffers_descriptors[closest];
-                const u64 cap = desc.indirect_offset != ~0U && !desc.is_written
-                                    ? (std::max<u64>)(compute ? 256_MiB : 64_MiB,
-                                                      Nx2StorageBuffers::PointerCap())
-                                    : Nx2StorageBuffers::PointerCap();
-                reach = gpu_memory->MaxContinuousRange(bases[closest], cap);
-                reached = entry - bases[closest] < reach;
-            }
-            const u64 key = shader_hash ^ (u64{probe.cbuf_index} << 59) ^ (u64{offset} << 24) ^
-                            (u64{probe.indirect_offset} * 0x9E3779B97F4A7C15ULL) ^ u64{reached};
-            if (seen.size() >= 5000 || !seen.insert(key).second) {
-                continue;
-            }
-            LOG_WARNING(HW_GPU,
-                        "Table coverage: frame={} {} stage={} hash={:016x} c{}[{:#x}]+{:#x} "
-                        "slot={} entry={:#x} no binding, {} (closest base {:#x}, reach {:#x}, {} "
-                        "buffers bound)",
-                        frame_tick, compute ? "compute" : "graphics", stage, shader_hash,
-                        probe.cbuf_index, offset, probe.indirect_offset, slot, entry,
-                        reached ? "reached by another" : "NOT REACHED",
-                        closest != bases.size() ? bases[closest] : GPUVAddr{0}, reach,
-                        bases.size());
-        }
-    }
-}
-
-template <class P>
 Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index, bool is_written,
                                              bool native_pointer, bool table_pointer,
                                              bool compute) const {
@@ -3126,22 +2981,27 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
                 static_cast<u32>(gpu_memory->GetMemoryLayoutSize(gpu_addr));
             // A pointer read from a table in memory is the base of an object pool, read anywhere in
             // it (Ocarina of Time's grass instances lie 12-18 MiB past theirs): bound to the end of
-            // its mapping, up to 64 MiB (256 MiB for compute: its fog light probes, SH records
-            // ~104-122 MiB past their pointer, all read 0 at 64 MiB and the volumetric fog lost its
-            // sky ambient). The 8 MiB cap made the grass reads return 0 and culled every blade.
-            // Written pools keep the cap: a write marks the whole binding GPU-modified.
+            // its mapping, up to 256 MiB. Its light probes, SH records ~104-122 MiB past their
+            // pointer, read 0 at 64 MiB: the volumetric fog lost its sky ambient (compute), and
+            // Kokiri Forest's water and foliage turned black after an area change (graphics). The
+            // 8 MiB cap made the grass reads return 0 and culled every blade. Written pools keep
+            // the cap: a write marks the whole binding GPU-modified.
             if (table_pointer && !is_written) {
+                // EDEN_NX2_GFX_TABLE_MIB=<1-1024> sets the graphics cap instead (testing).
+                static const u32 graphics_cap = [] {
+                    const char* text = std::getenv("EDEN_NX2_GFX_TABLE_MIB");
+                    const unsigned long mib = text ? std::strtoul(text, nullptr, 10) : 0;
+                    return mib > 0 && mib <= 1024 ? static_cast<u32>(mib << 20)
+                                                  : static_cast<u32>(256_MiB);
+                }();
                 return (std::min)(memory_layout_size,
-                                  static_cast<u32>((std::max<u64>)(
-                                      compute ? 256_MiB : 64_MiB,
-                                      Nx2StorageBuffers::PointerCap())));
+                                  compute ? static_cast<u32>(256_MiB) : graphics_cap);
             }
             // A native (Switch 2) compute program's pointer is bare: the word after it is another
             // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it
             // as one bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
             if (native_pointer) {
-                return (std::min)(memory_layout_size,
-                                  static_cast<u32>(Nx2StorageBuffers::PointerCap()));
+                return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
             }
             const u32 packed_size = static_cast<u32>(next_qword);
             const bool next_qword_is_size = static_cast<u32>(next_qword >> 32) == 0 &&
@@ -3149,17 +3009,12 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             if (next_qword_is_size) {
                 return packed_size;
             }
-            return (std::min)(memory_layout_size,
-                              static_cast<u32>(Nx2StorageBuffers::PointerCap()));
+            return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
         }();
         if ((native_pointer || table_pointer) && size != 0) {
             // Stop where the mapping or its device range does: the binding is one device range, and
             // a written one isn't split into separate ranges without sparse sources.
             size = static_cast<u32>(gpu_memory->MaxContinuousRange(gpu_addr, size));
-        }
-        if ((native_pointer || table_pointer) && Nx2StorageBuffers::CoverageEnabled()) {
-            Nx2StorageBuffers::NoteCappedBinding(gpu_addr, gpu_memory->GetMemoryLayoutSize(gpu_addr),
-                                                 size, is_written, native_pointer, table_pointer);
         }
 
         // Alignment only applies to the offset of the buffer
@@ -3183,8 +3038,8 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
             binding_size = aligned_size;
         }
         if constexpr (requires { runtime.GetMaxStorageBufferRange(); }) {
-            // A read-only pool's 256 MiB compute cap is above the 128 MiB every device
-            // guarantees. Only those are clamped, so no write is cut off.
+            // A read-only pool's 256 MiB cap is above the 128 MiB every device guarantees.
+            // Only those are clamped, so no write is cut off.
             if (table_pointer && !is_written) {
                 binding_size = (std::min)(binding_size, runtime.GetMaxStorageBufferRange());
             }

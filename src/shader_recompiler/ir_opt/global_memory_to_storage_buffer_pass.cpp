@@ -7,20 +7,19 @@
 #include <algorithm>
 #include <array>
 #include <bit>
-#include <cstdlib>
 #include <deque>
 #include <map>
 #include <optional>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
-#include <utility>
 
 #include <boost/container/flat_set.hpp>
 #include <boost/container/small_vector.hpp>
 
 #include "common/alignment.h"
 #include "shader_recompiler/environment.h"
+#include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/breadth_first_search.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
@@ -81,6 +80,11 @@ struct StorageInfo {
     std::unordered_set<const IR::Inst*> native_dynamic;
     /// A native access with several candidate pointers was left global.
     bool native_runtime_bounds{};
+    /// Paired accesses bind the loaded pointers that compete with their pair; cleared when those
+    /// leave too few bindings.
+    bool bind_competing_loaded{true};
+    /// A paired access bound the loaded pointers that compete with its pair.
+    bool competing_loaded_bound{};
     /// Pointer table entries reached through a phi or select of table pointers, or through a
     /// table pointer read from a dynamically indexed constant buffer array. They are bound only
     /// in the bindings the program's other storage buffers leave free (table_budget).
@@ -88,41 +92,11 @@ struct StorageInfo {
     bool tables_seen{};
     size_t table_budget{};
     size_t table_used{};
+    /// The storage buffers the pass without table entries bound; bound again, they take nothing
+    /// from table_budget, which they were left out of.
+    StorageBufferSet counted;
     small_vector<StorageBufferAddr, 8> table_candidates;
-    /// EDEN_NX2_TABLE_ALL_SLOTS: slots of a pointer array that were empty when the pipeline was
-    /// built bind too, in what the rest leaves free. Slots fill in later (a plant type that first
-    /// loads in another area) and a slot without a binding has no buffer to read from.
-    bool empty_slots_enabled{};
-    size_t empty_slot_budget{};
-    size_t empty_slots_used{};
-    small_vector<StorageBufferAddr, 8> empty_slot_candidates;
-    bool saw_pointer_array{};
-    bool budget_logged{};
-    small_vector<TablePointerProbe, 4> table_probes;
 };
-
-bool EnvFlag(const char* name) {
-    const char* const value{std::getenv(name)};
-    return value != nullptr && *value != '\0' && *value != '0';
-}
-
-void AddTableProbe(StorageInfo& info, u32 index, u32 first, u32 stride, u32 indirect) {
-    const TablePointerProbe probe{index, first, stride, indirect};
-    if (std::ranges::find(info.table_probes, probe) == info.table_probes.end()) {
-        info.table_probes.push_back(probe);
-    }
-    info.saw_pointer_array |= stride != 0;
-}
-
-void NoteEmptySlot(StorageInfo& info, const StorageBufferAddr& pointer) {
-    if (std::ranges::find(info.empty_slot_candidates, pointer) ==
-        info.empty_slot_candidates.end()) {
-        info.empty_slot_candidates.push_back(pointer);
-    }
-    if (std::ranges::find(info.table_candidates, pointer) == info.table_candidates.end()) {
-        info.table_candidates.push_back(pointer);
-    }
-}
 
 /// Returns true when the instruction is a global memory instruction
 bool IsGlobalMemory(const IR::Inst& inst) {
@@ -178,6 +152,24 @@ bool IsGlobalMemory(const IR::Inst& inst) {
     case IR::Opcode::GlobalAtomicMinF32x2:
     case IR::Opcode::GlobalAtomicMaxF16x2:
     case IR::Opcode::GlobalAtomicMaxF32x2:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// Returns true when the backend can pick a global access's buffer among the bound ones at run time
+bool IsRuntimeRoutable(const IR::Inst& inst) {
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::LoadGlobal32:
+    case IR::Opcode::LoadGlobal64:
+    case IR::Opcode::LoadGlobal128:
+    case IR::Opcode::WriteGlobal32:
+    case IR::Opcode::WriteGlobal64:
+    case IR::Opcode::WriteGlobal128:
+    case IR::Opcode::GlobalAtomicIAdd32:
+    case IR::Opcode::GlobalAtomicUMax32:
+    case IR::Opcode::GlobalAtomicCompareExchange32:
         return true;
     default:
         return false;
@@ -1155,19 +1147,12 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                 std::unordered_set<const IR::Inst*> slot_visited;
                 CollectPointerSlots(offset, slots, slot_visited);
                 for (const auto& [first, stride] : slots) {
-                    AddTableProbe(info, index.U32(), first, stride, ~0U);
                     for (u32 slot = 0; slot < (stride ? max_slots : 1U); ++slot) {
                         const StorageBufferAddr pointer{.index = index.U32(),
                                                         .offset = first + slot * stride};
-                        if (!Common::IsAligned(pointer.offset, 8) ||
-                            std::ranges::find(candidates, pointer) != candidates.end()) {
-                            continue;
-                        }
-                        if (env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)) {
-                            candidates.push_back(pointer);
-                            dynamic = true;
-                        } else if (info.empty_slots_enabled && stride != 0) {
-                            NoteEmptySlot(info, pointer);
+                        if (Common::IsAligned(pointer.offset, 8) &&
+                            std::ranges::find(candidates, pointer) == candidates.end() &&
+                            env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)) {
                             candidates.push_back(pointer);
                             dynamic = true;
                         }
@@ -1302,7 +1287,6 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                 if (holder->Arg(1).IsImmediate()) {
                     const StorageBufferAddr pointer{
                         .index = index, .offset = holder->Arg(1).U32(), .indirect = indirect};
-                    AddTableProbe(info, pointer.index, pointer.offset, 0, pointer.indirect);
                     if (Common::IsAligned(pointer.offset, 8) &&
                         env.IsCbufStorageBufferPointer(pointer.index, pointer.offset)) {
                         add(pointer, via_phi || !holder_addr);
@@ -1314,18 +1298,12 @@ small_vector<StorageBufferAddr, 4> NativePointerCandidates(const IR::U32& low_ad
                 std::unordered_set<const IR::Inst*> slot_visited;
                 CollectPointerSlots(holder->Arg(1), slots, slot_visited);
                 for (const auto& [first, stride] : slots) {
-                    AddTableProbe(info, index, first, stride, indirect);
                     for (u32 slot = 0; slot < (stride ? max_slots : 1U); ++slot) {
                         const StorageBufferAddr pointer{
                             .index = index, .offset = first + slot * stride, .indirect = indirect};
-                        if (!Common::IsAligned(pointer.offset, 8)) {
-                            continue;
-                        }
-                        if (env.IsCbufIndirectStorageBufferPointer(pointer.index, pointer.offset,
+                        if (Common::IsAligned(pointer.offset, 8) &&
+                            env.IsCbufIndirectStorageBufferPointer(pointer.index, pointer.offset,
                                                                    pointer.indirect)) {
-                            add(pointer, true);
-                        } else if (info.empty_slots_enabled && stride != 0) {
-                            NoteEmptySlot(info, pointer);
                             add(pointer, true);
                         }
                     }
@@ -1365,10 +1343,14 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
     const bool native = env.IsNativeProgram();
     if (native && storage_buffer &&
         !env.IsCbufStorageBufferPointer(storage_buffer->index, storage_buffer->offset)) {
-        AddTableProbe(info, storage_buffer->index, storage_buffer->offset, 0, ~0U);
         storage_buffer.reset();
     }
-    if (native && !storage_buffer && !low_addr.IsImmediate()) {
+    // A paired constant buffer pointer can be only one input of a select or phi whose other input
+    // is a pointer loaded from that buffer (Ocarina of Time's foliage unit placement records are
+    // read from c0[12] or from *c0[12]). Rebasing on the constant buffer pointer then reads the
+    // loaded path's records out of bounds, as zeros, so look for loaded pointers here as well.
+    const bool paired_found = storage_buffer.has_value();
+    if (native && !low_addr.IsImmediate()) {
         const IR::Inst* const start{low_addr.InstRecursive()};
         auto it{info.native_candidates.find(start)};
         if (it == info.native_candidates.end()) {
@@ -1381,39 +1363,41 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
             }
         }
         const auto& candidates{it->second};
-        if (candidates.size() > 1 || (!candidates.empty() && info.native_dynamic.contains(start))) {
+        const bool has_loaded_pointer{std::ranges::any_of(
+            candidates, [](const StorageBufferAddr& c) { return c.indirect != ~0U; })};
+        if (paired_found &&
+            (!has_loaded_pointer || !info.bind_competing_loaded || !IsRuntimeRoutable(inst))) {
+            // No pointer loaded from memory competes with the paired one, or the access cannot
+            // stay global: keep the pair.
+        } else if (candidates.size() > 1 || paired_found ||
+                   (!candidates.empty() && info.native_dynamic.contains(start))) {
             // Bind every candidate and keep the access global; the backend picks the buffer at
             // run time. Rebasing on one of them drops the other path's accesses.
             bool accepted{};
+            if (paired_found) {
+                // The paired pointer is the other input of the select or phi; bind it too.
+                info.competing_loaded_bound = true;
+                info.set.insert(*storage_buffer);
+                if (IsGlobalMemoryWrite(inst)) {
+                    info.writes.insert(*storage_buffer);
+                }
+            }
             for (const StorageBufferAddr& candidate : candidates) {
                 if (std::ranges::find(info.table_candidates, candidate) !=
                     info.table_candidates.end()) {
                     const StorageBufferAddr holder{.index = candidate.index,
                                                    .offset = candidate.offset};
+                    const auto takes_binding = [&info](const StorageBufferAddr& buffer) {
+                        return info.set.find(buffer) == info.set.end() &&
+                               !info.counted.contains(buffer);
+                    };
                     const size_t added{
-                        (info.set.find(candidate) == info.set.end() ? 1U : 0U) +
-                        (candidate.indirect != ~0U && info.set.find(holder) == info.set.end()
-                             ? 1U
-                             : 0U)};
-                    const bool empty_slot{std::ranges::find(info.empty_slot_candidates, candidate) !=
-                                          info.empty_slot_candidates.end()};
-                    if (empty_slot ? info.empty_slots_used + added > info.empty_slot_budget
-                                   : info.table_used + added > info.table_budget) {
-                        static const bool trace{EnvFlag("EDEN_NX2_TABLE_COVERAGE")};
-                        if (trace && !empty_slot && !std::exchange(info.budget_logged, true)) {
-                            LOG_WARNING(Shader,
-                                        "Table coverage: program {:#x} is out of storage buffers "
-                                        "at c{}[{:#x}]+{:#x} ({} used, budget {})",
-                                        env.StartAddress(), candidate.index, candidate.offset,
-                                        candidate.indirect, info.table_used, info.table_budget);
-                        }
+                        (takes_binding(candidate) ? 1U : 0U) +
+                        (candidate.indirect != ~0U && takes_binding(holder) ? 1U : 0U)};
+                    if (info.table_used + added > info.table_budget) {
                         continue;
                     }
-                    // The descriptors are a fixed array.
-                    if (info.set.size() + added > Info::MAX_SSBOS) {
-                        continue;
-                    }
-                    (empty_slot ? info.empty_slots_used : info.table_used) += added;
+                    info.table_used += added;
                 }
                 info.set.insert(candidate);
                 if (IsGlobalMemoryWrite(inst)) {
@@ -1431,7 +1415,7 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
                 return;
             }
             // Only table entries, and no free binding for them: as if none had been found.
-        } else if (candidates.size() == 1) {
+        } else if (candidates.size() == 1 && !paired_found) {
             // The one pointer the address is built from. The NVN search below only takes 16-byte
             // aligned slots, so for a pointer at an 8-byte slot it can return a dimension or stride
             // the address arithmetic reads instead, and the access then lands in the wrong buffer.
@@ -1626,8 +1610,11 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     if (!has_global_memory) {
         return;
     }
+    const size_t max_ssbos{StorageBufferLimit(host_info)};
     TrackingConditions conditions{program};
     StorageInfo info;
+    // Without 64-bit integers the backend cannot route global accesses among bound buffers.
+    info.bind_competing_loaded = host_info.support_int64;
     info.iterator_words = CollectIteratorWords(program);
     info.atomic_pointers = CollectAtomicPointers(program);
     const auto collect = [&] {
@@ -1642,32 +1629,37 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
         }
     };
     collect();
-    if (info.tables_seen && info.set.size() < Info::MAX_SSBOS) {
+    if (info.competing_loaded_bound && info.set.size() > max_ssbos) {
+        // Not enough bindings for the loaded pointers that compete with paired ones: keep the
+        // pairs, as if no loaded pointer competed.
+        StorageInfo paired;
+        paired.iterator_words = std::move(info.iterator_words);
+        paired.atomic_pointers = std::move(info.atomic_pointers);
+        paired.bind_competing_loaded = false;
+        info = std::move(paired);
+        collect();
+    }
+    if (info.tables_seen && info.set.size() < max_ssbos) {
         // Again with pointer table entries, in the bindings the first pass left free.
         StorageInfo with_tables;
-        with_tables.iterator_words = std::move(info.iterator_words);
-        with_tables.atomic_pointers = std::move(info.atomic_pointers);
+        with_tables.iterator_words = info.iterator_words;
+        with_tables.atomic_pointers = info.atomic_pointers;
+        with_tables.bind_competing_loaded = info.bind_competing_loaded;
         with_tables.tables_enabled = true;
-        with_tables.table_budget = Info::MAX_SSBOS - info.set.size();
-        info = std::move(with_tables);
+        with_tables.table_budget = max_ssbos - info.set.size();
+        with_tables.counted = info.set;
+        std::swap(info, with_tables);
         collect();
+        if (info.set.size() > max_ssbos) {
+            // Never more storage buffers than a stage binds: without the table entries, then.
+            info = std::move(with_tables);
+        }
     }
-    static const bool bind_empty_slots{EnvFlag("EDEN_NX2_TABLE_ALL_SLOTS")};
-    if (bind_empty_slots && info.saw_pointer_array && env.ShaderStage() == Stage::Compute &&
-        info.set.size() < Info::MAX_SSBOS) {
-        // Once more with the empty slots, in the bindings the mapped ones leave free.
-        StorageInfo with_empty;
-        with_empty.iterator_words = std::move(info.iterator_words);
-        with_empty.atomic_pointers = std::move(info.atomic_pointers);
-        with_empty.tables_enabled = true;
-        with_empty.table_budget =
-            info.tables_enabled ? info.table_budget : Info::MAX_SSBOS - info.set.size();
-        with_empty.empty_slots_enabled = true;
-        with_empty.empty_slot_budget = Info::MAX_SSBOS - info.set.size();
-        info = std::move(with_empty);
-        collect();
+    if (info.set.size() > max_ssbos) {
+        // Binding only some of them would drop the accesses through the others.
+        throw NotImplementedException("Binding {} storage buffers to a stage that binds {}",
+                                      info.set.size(), max_ssbos);
     }
-    program.info.table_probes = info.table_probes;
     program.info.native_global_bounds |= info.native_runtime_bounds;
     for (const StorageBufferAddr& storage_buffer : info.set) {
         program.info.storage_buffers_descriptors.push_back({
@@ -1690,7 +1682,18 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     }
 }
 
-void JoinStorageInfo(Info& base, Info& source) {
+size_t StorageBufferLimit(const HostTranslateInfo& host_info) {
+    size_t limit{Info::MAX_SSBOS};
+    for (const u32 device_limit : {host_info.max_per_stage_descriptor_storage_buffers,
+                                   host_info.max_descriptor_set_storage_buffers}) {
+        if (device_limit != 0) {
+            limit = (std::min)(limit, size_t{device_limit});
+        }
+    }
+    return limit;
+}
+
+void JoinStorageInfo(Info& base, Info& source, size_t limit) {
     base.requires_coherent_global_memory |= source.requires_coherent_global_memory;
     base.native_global_bounds |= source.native_global_bounds;
     auto& descriptors = base.storage_buffers_descriptors;
@@ -1703,6 +1706,10 @@ void JoinStorageInfo(Info& base, Info& source) {
         if (it != descriptors.end()) {
             it->is_written |= desc.is_written;
             continue;
+        }
+        if (descriptors.size() >= limit) {
+            throw NotImplementedException("Binding {} storage buffers to a stage that binds {}",
+                                          descriptors.size() + 1, limit);
         }
         descriptors.push_back(desc);
     }

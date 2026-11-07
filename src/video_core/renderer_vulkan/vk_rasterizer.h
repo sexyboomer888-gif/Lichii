@@ -130,6 +130,7 @@ public:
     void SignalSyncPoint(u32 value) override;
     void SignalReference() override;
     void ReleaseFences(bool force = true) override;
+    void FlushQueryResults(DAddr addr, u64 size) override;
     void FlushAndInvalidateRegion(
         DAddr addr, u64 size, VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void WaitForIdle() override;
@@ -204,7 +205,7 @@ private:
     /// the GPU makes them now (BufferCache::Nx2CopyListPages).
     void SubmitNx2ListCopies();
 
-    void UpdateDynamicStates();
+    void UpdateDynamicStates(GraphicsPipeline* draw_pipeline = nullptr);
 
     void HandleTransformFeedback();
 
@@ -281,8 +282,6 @@ private:
     u32 draw_counter = 0;
     u64 render_trace_frame = 0;
     u32 render_trace_draws = 0;
-    /// Task, mesh and fragment hashes of the draw being prepared, for EDEN_NX2_MESH_COUNT_TRACE.
-    std::array<u64, 3> mesh_trace_hashes{};
     u32 render_trace_clears = 0;
     bool pending_native_work{};
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline

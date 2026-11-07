@@ -7,7 +7,6 @@
 #pragma once
 
 #include <array>
-#include <compare>
 #include <optional>
 #include <span>
 #include <vector>
@@ -171,19 +170,6 @@ struct ConstantBufferDescriptor {
     auto operator<=>(const ConstantBufferDescriptor&) const = default;
 };
 
-/// A pointer the storage buffer pass looked at: a constant buffer slot, or an array of them with
-/// a stride, and with an indirect offset when the pointer is read from the memory the slot points
-/// to. Whether a slot gets a binding is decided once, when the pipeline is built; this is what a
-/// later check (EDEN_NX2_TABLE_COVERAGE) reads again.
-struct TablePointerProbe {
-    u32 cbuf_index;
-    u32 first;
-    u32 stride;
-    u32 indirect_offset;
-
-    auto operator<=>(const TablePointerProbe&) const = default;
-};
-
 struct StorageBufferDescriptor {
     u32 cbuf_index;
     u32 cbuf_offset;
@@ -288,7 +274,9 @@ struct MeshInfo {
 struct Info {
     static constexpr size_t MAX_INDIRECT_CBUFS{14};
     static constexpr size_t MAX_CBUFS{18};
-    static constexpr size_t MAX_SSBOS{32};
+    /// Native (Switch 2) programs take their storage buffers from raw pointers, as many as they
+    /// read: Ocarina of Time's foliage culling binds 37 for its lists and per-type instance tables.
+    static constexpr size_t MAX_SSBOS{64};
 
     bool is_task{}; ///< Switch 2 task program (Stage::Task)
     bool is_mesh{}; ///< Switch 2 mesh program (Stage::Mesh)
@@ -388,7 +376,6 @@ struct Info {
     boost::container::static_vector<ConstantBufferDescriptor, MAX_CBUFS>
         constant_buffer_descriptors;
     boost::container::static_vector<StorageBufferDescriptor, MAX_SSBOS> storage_buffers_descriptors;
-    boost::container::small_vector<TablePointerProbe, 4> table_probes;
     TextureBufferDescriptors texture_buffer_descriptors;
     ImageBufferDescriptors image_buffer_descriptors;
     TextureDescriptors texture_descriptors;

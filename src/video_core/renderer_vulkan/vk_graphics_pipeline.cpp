@@ -431,7 +431,6 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                                                        desc.indirect_offset);
                 ++ssbo_index;
             }
-            buffer_cache.CheckTableCoverage(false, stage, info, key.unique_hashes[stage + 1]);
         }
         const auto& cbufs{maxwell3d->state.shader_stages[stage].const_buffers};
         const auto read_handle{[&](const auto& desc, u32 index) {
