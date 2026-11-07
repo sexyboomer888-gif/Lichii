@@ -23,16 +23,15 @@ jobs:
           ref: fix/oot-88
           path: repo
           fetch-depth: 0
-      - name: Build 21 on upstream nx2 9fa4a71f
+      - name: Build 22 on upstream nx2 65e979ad
         working-directory: repo
         run: |
           set -eux
           git config user.name "github-actions[bot]"
           git config user.email "41898732+github-actions[bot]@users.noreply.github.com"
-          test "$(git rev-parse HEAD)" = fbb8d70723d21ec7a99d15cd682e2aab10a6a144
+          test "$(git rev-parse HEAD)" = f3523bbf2638d916447891b58eaf69d9f94ec831
           git update-ref refs/heads/fork_tip HEAD
-          base64 -d ../ci/meshpoints21.patch.xz.b64 | xz -d > "$RUNNER_TEMP/meshpoints21.patch"
-          PATCH_DIR="$RUNNER_TEMP" bash ../ci/build21.sh
-          test "$(git rev-parse 'HEAD^{tree}')" = ce1495ba7ed8cd6f37d65c2f7d4c9dd2933ec7bb
-          git merge-base --is-ancestor fbb8d70723d21ec7a99d15cd682e2aab10a6a144 HEAD
+          bash ../ci/build22.sh
+          test "$(git rev-parse 'HEAD^{tree}')" = 8c210377bb643fbf40e853cbda4af65fa8833544
+          git merge-base --is-ancestor f3523bbf2638d916447891b58eaf69d9f94ec831 HEAD
           git push origin HEAD:fix/oot-88
