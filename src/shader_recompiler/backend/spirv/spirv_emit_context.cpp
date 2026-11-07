@@ -1873,9 +1873,12 @@ void EmitContext::DefineMesh(const IR::Program& program) {
 
     const Id vertex_count{Const(mesh_info.max_vertices)};
     const Id primitive_count{Const(mesh_info.max_primitives)};
-    mesh_primitive_indices =
-        DefineVariable(*this, TypeArray(U32[3], primitive_count),
-                       spv::BuiltIn::PrimitiveTriangleIndicesEXT, spv::StorageClass::Output);
+    const bool mesh_points{mesh_info.topology == 0};
+    mesh_primitive_indices = DefineVariable(
+        *this, TypeArray(mesh_points ? U32[1] : U32[3], primitive_count),
+        mesh_points ? spv::BuiltIn::PrimitivePointIndicesEXT
+                    : spv::BuiltIn::PrimitiveTriangleIndicesEXT,
+        spv::StorageClass::Output);
     std::array<Id, IR::NUM_GENERICS> generics[2]{};
     Id point_size{}, primitive_layer{}, primitive_viewport{}, primitive_id_output{};
     const auto per_primitive_builtin = [&](Id& variable, spv::BuiltIn builtin) {
@@ -1940,6 +1943,11 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     }
     for (const u32 line : mesh_info.primitive_lines) {
         mesh_primitive_targets.push_back(target(line, true));
+    }
+    if (mesh_points && !Sirit::ValidId(point_size)) {
+        // Vulkan wants a size on every point; the guest takes it from the point size register.
+        mesh_fixed_point_size = DefineVariable(*this, TypeArray(F32[1], vertex_count),
+                                               spv::BuiltIn::PointSize, spv::StorageClass::Output);
     }
 }
 

@@ -458,6 +458,20 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         TraceRenderState(is_indexed, "mesh-skipped", nullptr);
         return;
     }
+    // EDEN_NX2_NO_MESH_POINTS=1: skip only the task/mesh draws that output points (rejected before
+    // point output was supported). EDEN_NX2_NO_MESH_POINTS_FILE=<path>: skip them while that file
+    // exists (checked every 1024 draws), to compare the same scene with and without them.
+    static const bool no_points_always{std::getenv("EDEN_NX2_NO_MESH_POINTS") != nullptr};
+    static const char* const no_points_file{std::getenv("EDEN_NX2_NO_MESH_POINTS_FILE")};
+    static bool no_points{no_points_always};
+    static u32 no_points_check{};
+    if (no_points_file && (no_points_check++ % 1024) == 0) {
+        no_points = std::filesystem::exists(no_points_file);
+    }
+    if (mesh_draw && no_points && pipeline->HasMeshPoints()) {
+        TraceRenderState(is_indexed, "mesh-points-skipped", nullptr);
+        return;
+    }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);

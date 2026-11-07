@@ -280,6 +280,7 @@ struct Info {
 
     bool is_task{}; ///< Switch 2 task program (Stage::Task)
     bool is_mesh{}; ///< Switch 2 mesh program (Stage::Mesh)
+    bool is_mesh_points{}; ///< mesh program that outputs points (SET_MESH_SHADER_A topology 0)
     bool uses_workgroup_id{};
     bool uses_local_invocation_id{};
     bool uses_invocation_id{};

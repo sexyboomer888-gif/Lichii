@@ -125,6 +125,11 @@ public:
     [[nodiscard]] bool IsMeshPipeline() const noexcept {
         return stage_infos[0].is_task || stage_infos[0].is_mesh;
     }
+
+    /// Task/mesh pipeline whose mesh program outputs points.
+    [[nodiscard]] bool HasMeshPoints() const noexcept {
+        return stage_infos[0].is_mesh_points || stage_infos[1].is_mesh_points;
+    }
     GraphicsPipeline& operator=(GraphicsPipeline&&) noexcept = delete;
     GraphicsPipeline(GraphicsPipeline&&) noexcept = delete;
 
