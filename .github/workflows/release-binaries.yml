@@ -79,30 +79,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: linux-x86_64
-            runner: ubuntu-24.04
-          # The two -pgo builds are the same programs compiled by clang against the repo's
-          # eglantine.profdata. Eden's profile (Eden-CI/PGO) comes from Switch 1 games: with it Mario
-          # Kart World ran at about half the speed of the normal build, with eglantine.profdata at
-          # about the same speed. Windows uses MSYS2's MinGW clang like Eden does; MSVC cannot read
-          # an LLVM .profdata file.
-          - platform: linux-x86_64-pgo
-            runner: ubuntu-24.04
-            pgo: true
           - platform: windows-x86_64
             runner: windows-2022
           - platform: windows-x86_64-pgo
             runner: windows-2022
             pgo: true
             mingw: true
-          - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
-          - platform: linux-aarch64-pgo
-            runner: ubuntu-24.04-arm
-            pgo: true
-          - platform: macos-arm64
-            runner: macos-15
-
     steps:
       - name: Check out source
         uses: actions/checkout@v5
@@ -239,6 +221,7 @@ jobs:
             vulkan-memory-allocator:p vulkan-devel:p glslang:p enet:p opus:p
             libusb:p unordered_dense:p jbigkit:p xz:p libdeflate:p bzip2:p
             lerc:p graphite2:p libwebp:p libtiff:p brotli:p ccache:p
+            ffmpeg:p
 
       - name: Restore CPM downloads
         id: cpm-cache
@@ -360,7 +343,7 @@ jobs:
             -DYUZU_ROOM_STANDALONE=OFF \
             -DYUZU_USE_BUNDLED_QT=OFF \
             -DYUZU_USE_BUNDLED_SDL3=ON \
-            -DYUZU_USE_BUNDLED_FFMPEG=ON \
+            -DYUZU_USE_BUNDLED_FFMPEG=OFF \
             -DVulkanHeaders_FORCE_BUNDLED=ON \
             -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
             -DENABLE_UPDATE_CHECKER=ON \
@@ -411,8 +394,9 @@ jobs:
             .sccache
           key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
 
-      # Plain tar.gz with the two programs and switch defaults. GitHub artifacts drop executable
-      # bits, so a tar preserves them. This needs Qt 6 and the usual system libraries installed.
+      # Plain tar.gz with the two programs. GitHub artifacts drop the executable bit, so a tar is
+      # what keeps it. This one is not self-contained: it needs Qt 6 and the usual libraries
+      # installed on the system.
       - name: Package Linux tar.gz
         if: startsWith(matrix.platform, 'linux')
         shell: bash
@@ -422,7 +406,7 @@ jobs:
           test -x build/release/bin/eden-cli
           strip build/release/bin/lichii build/release/bin/eden-cli
           tar -czf "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz" \
-            -C build/release/bin lichii eden-cli nx2_switches.txt
+            -C build/release/bin lichii eden-cli
           ls -la "lichii-${GITHUB_SHA}-${{ matrix.platform }}.tar.gz"
 
       # A self-contained AppImage: linuxdeploy bundles every library the two programs need except
@@ -456,8 +440,6 @@ jobs:
           export LDAI_OUTPUT="lichii-${GITHUB_SHA}-${{ matrix.platform }}.AppImage"
           export OUTPUT="$LDAI_OUTPUT"
           export ARCH="$arch"
-          mkdir -p AppDir/usr/bin
-          cp build/release/bin/nx2_switches.txt AppDir/usr/bin/
           "$tools/linuxdeploy-$arch.AppImage" --appdir AppDir \
             --executable build/release/bin/lichii \
             --executable build/release/bin/eden-cli \
