@@ -34,10 +34,6 @@ struct TICEntry;
 }
 } // namespace Tegra
 
-namespace VideoCommon::OotNetwork {
-struct BypassState;
-}
-
 namespace VideoCore {
 
 enum class LoadCallbackStage {
@@ -142,10 +138,6 @@ public:
                                                  [[maybe_unused]] u64 size) {
         return false;
     }
-
-    /// Submits the work recorded so far with a fence behind the report writes still pending, so
-    /// they finish without waiting for the next submission. Called on the split's back.
-    virtual void SubmitQueryWork() {}
 
     /// Notify rasterizer that any caches of the specified region should be invalidated
     virtual void InvalidateRegion(DAddr addr, u64 size,
@@ -254,12 +246,6 @@ public:
     [[nodiscard]] virtual std::optional<VideoCore::GameDlssProbe> ProbeGameDlssOutput(
         const Tegra::Engines::Fermi2D::Surface& src, const Tegra::Engines::Fermi2D::Surface& dst) {
         return std::nullopt;
-    }
-
-    /// State of the Ocarina of Time anti-aliasing network bypass (oot_network.h), or null when
-    /// this backend cannot bypass it.
-    [[nodiscard]] virtual VideoCommon::OotNetwork::BypassState* OotNetworkBypass() {
-        return nullptr;
     }
 
     [[nodiscard]] virtual Tegra::Engines::AccelerateDMAInterface& AccessAccelerateDMA() = 0;

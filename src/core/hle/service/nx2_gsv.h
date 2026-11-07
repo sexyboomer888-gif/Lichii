@@ -29,7 +29,6 @@
 #include "common/div_ceil.h"
 #include "common/dkb_frame_trace.h"
 #include "common/game_presets.h"
-#include "common/nx2_movie_clock.h"
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
@@ -434,27 +433,27 @@ private:
         TipcReplyWords(ctx, {1});
     }
 
-    // Used by nn::gpu::sdk::CreateGpuAddressSpace: three u64s after the result, a kind (< 5, 0 =
-    // none) and the GPU VA range of the in-process VirtualMachine that serves AllocSpace
-    // (nn::gpu::sdk::util::ExecuteVirtualMachineAllocSpace). NVN reserves fixed VA from 0x8000000
-    // up to 512 GiB, so report the same range NvRm gives AllocAsEx: [0x8000000, 0xC000000000).
+    /// Reports the GPU VA range NVN reserves, [Nx2GpuVaStart, Nx2GpuVaEnd), to
+    /// nn::gpu::sdk::CreateGpuAddressSpace. Three u64s follow the result: a kind (< 5, 0 =
+    /// none) and the range of the in-process VirtualMachine that serves AllocSpace
+    /// (nn::gpu::sdk::util::ExecuteVirtualMachineAllocSpace).
     void GetVaRange(HLERequestContext& ctx) {
         LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 203 [2]={:#x}", ctx.CommandBuffer()[2]);
         constexpr u64 kind = 1;
-        constexpr u64 start = 0x8000000ULL;
-        constexpr u64 size = 0xC000000000ULL - start;
+        constexpr u64 start = Tegra::Nx2GpuVaStart;
+        constexpr u64 size = Tegra::Nx2GpuVaEnd - start;
         TipcReplyWords(ctx, {static_cast<u32>(kind), static_cast<u32>(kind >> 32),
                              static_cast<u32>(start), static_cast<u32>(start >> 32),
                              static_cast<u32>(size), static_cast<u32>(size >> 32)});
     }
 
-    // Newer SDKs (title 1) query the address space's user and gsv partitions with 201/202(id):
-    // two u64s each, stored as the partition's min/max. The user value works whether it is read
-    // as (start, size) or (min, max). Title 4 never needed the gsv partition, so it stays empty.
+    /// Reports the user partition (TIPC 201) as two u64s, [Nx2GpuVaStart, Nx2GpuVaEnd).
+    /// Newer SDKs (title 1) also query the gsv partition with 202. The user value works
+    /// whether it is read as (start, size) or (min, max). Title 4 leaves gsv empty.
     void GetUserPartition(HLERequestContext& ctx) {
         LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 201 [2]={:#x}", ctx.CommandBuffer()[2]);
-        constexpr u64 first = 0x8000000ULL;
-        constexpr u64 second = 0xC000000000ULL - first;
+        constexpr u64 first = Tegra::Nx2GpuVaStart;
+        constexpr u64 second = Tegra::Nx2GpuVaEnd - first;
         TipcReplyWords(ctx, {static_cast<u32>(first), static_cast<u32>(first >> 32),
                              static_cast<u32>(second), static_cast<u32>(second >> 32)});
     }
@@ -682,16 +681,32 @@ private:
         rb.Push(ResultSuccess);
     }
 
-    // Sub 215 (nn::gpu::sdk::DestroySparseRegion): words 3-6 the range, word 8 the job slot, like
-    // 213. Drop the GPU mapping, then the backing 214 added: its SMMU mapping (in GPU-thread
-    // order) and, once the GPU thread is past that, its pages. Kept allocated, title 1 ran the
-    // pool dry within minutes and later regions had no memory at all (GPU writes to them lost).
+    /// Drops a sparse or GPU-only region (nn::gpu::sdk::DestroySparseRegion, sub 215).
+    /// Words 3-6 are the inclusive range, word 8 the job slot, like 213. The GPU mapping
+    /// goes first, then the backing 214 added: its SMMU mapping (in GPU-thread order) and,
+    /// once the GPU thread is past that, its pages. Kept allocated, title 1 ran the pool dry
+    /// within minutes and later regions had no memory at all (GPU writes to them lost).
+    /// A range that extends past the GMMU is refused whole: the page tables would keep the
+    /// part that fits, so releasing backing here would free memory that is still mapped.
     void SubDestroySparseRegion(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         const u64 first = u64{w[3]} | (u64{w[4]} << 32);
         const u64 last = u64{w[5]} | (u64{w[6]} << 32);
         LOG_DEBUG(Service, "nx2:gpu 215 destroy sparse region [{:#x}, {:#x}] words {:#x} {:#x} {:#x} {:#x}",
                  first, last, w[1], w[2], w[7], w[8]);
+        // last is inclusive. Both ends have to sit inside the address space; `last - first + 1`
+        // is then the size PageTableOp will actually unmap.
+        if (last > first && (first >= Tegra::Nx2GpuAddressSpaceSize ||
+                             last >= Tegra::Nx2GpuAddressSpaceSize)) {
+            LOG_ERROR(Service,
+                      "nx2:gpu 215 region [{:#x}, {:#x}] extends past the {:#x}-byte GPU address "
+                      "space; leaving it mapped",
+                      first, last, Tegra::Nx2GpuAddressSpaceSize);
+            SignalAfterGpu(w[8]);
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(ResultSuccess);
+            return;
+        }
         std::scoped_lock lk{m_region_mutex};
         FreeReleasedRegions();
         if (m_gpu_only_ranges.erase(first) != 0 && last > first) {
@@ -1740,7 +1755,14 @@ private:
         if (Common::DkbFrameTrace::Enabled()) {
             m_vsync->trace_present.store(m_presents, std::memory_order_relaxed);
         }
-        Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
+        const u64 present = Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (Core::g_nx2_present_time_services.load(std::memory_order_relaxed) != 0) {
+            const u64 present_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count();
+            Core::g_nx2_present_times_ns[present % Core::g_nx2_present_times_ns.size()].store(
+                present_ns, std::memory_order_relaxed);
+        }
         if (m_presents <= 4 || (m_presents % 600) == 0) {
             LOG_INFO(Service, "nx2:vi2 229 present #{} token={:#x} slot={} image={}", m_presents,
                      u64{w[2]} | (u64{w[3]} << 32), w[4], w[5]);
@@ -1860,54 +1882,9 @@ private:
                 m_stats = {.last_present = entered};
             }
         }
-        if (Common::Nx2MovieClock::Enabled()) {
-            LogMovieClock(paced);
-        }
         constexpr u64 AvailableSlots = 0x7fff;
         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
                              static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
-    }
-
-    struct MovieClockState {
-        std::chrono::steady_clock::time_point wall{};
-        s64 guest_ns{};
-        u64 presents{};
-        std::array<u64, 12> counts{};
-    };
-    MovieClockState m_movie_clock{};
-
-    void LogMovieClock(std::chrono::steady_clock::time_point now) {
-        auto& c = Common::Nx2MovieClock::Get();
-        const auto load = [](const std::atomic<u64>& v) { return v.load(std::memory_order_relaxed); };
-        const std::array<u64, 12> counts{
-            load(c.video_takes),    load(c.video_releases),   load(c.take_to_release_us),
-            load(c.renderer_updates), load(c.renderer_passes), load(c.voices_dropped),
-            load(c.voice_samples),  load(c.sink_frames[0]),    load(c.sink_padded[0]),
-            load(c.sink_frames[1]), load(c.sink_padded[1]),    0};
-        const s64 guest_ns = system.CoreTiming().GetGlobalTimeNs().count();
-        auto& last = m_movie_clock;
-        ++last.presents;
-        if (last.wall == std::chrono::steady_clock::time_point{}) {
-            last = {now, guest_ns, 0, counts};
-            return;
-        }
-        if (now - last.wall < std::chrono::seconds{1}) {
-            return;
-        }
-        std::array<u64, 12> d{};
-        for (size_t i = 0; i < d.size(); ++i) {
-            d[i] = counts[i] - last.counts[i];
-        }
-        const double wall_ms = std::chrono::duration<double, std::milli>(now - last.wall).count();
-        LOG_INFO(Service,
-                 "Nx2 movie clock: wall {:.1f} ms, guest {:.1f} ms | presents {} | video takes {} "
-                 "releases {} take->release {:.1f} ms, pts {:.3f} s | audio updates {} passes {} "
-                 "dropped {} voice samples {} | sink0 {} ({} padded) sink1 {} ({} padded)",
-                 wall_ms, static_cast<double>(guest_ns - last.guest_ns) / 1e6, last.presents,
-                 d[0], d[1], d[1] ? static_cast<double>(d[2]) / static_cast<double>(d[1]) / 1000.0 : 0.0,
-                 static_cast<double>(load(c.video_last_pts_us)) / 1e6, d[3], d[4], d[5], d[6], d[7],
-                 d[8], d[9], d[10]);
-        last = {now, guest_ns, 0, counts};
     }
 
     // The console's compositor frees a buffer only once its frame's GPU fence has passed, which
@@ -1941,9 +1918,17 @@ private:
         bool deadline_reset{};
     } m_frame_trace;
 
-    // timing: present word 12, (swap interval << 16) | refresh rate. Fire Emblem: Fortune's Weave
-    // sends 0x1003c during its boot logos and 0x2003c (two vblanks per frame, 30 fps) after; paced
-    // at every vblank it ran at double speed. EDEN_NX2_SWAP_INTERVAL=<n> forces the interval.
+    /**
+     * Holds this present until the next vblank its word asks for, or for longer when an FPS limit
+     * (the setting, or EDEN_NX2_FPS_LIMIT) is below that rate.
+     *
+     * Fire Emblem: Fortune's Weave sends 0x1003c during its boot logos and 0x2003c (two vblanks
+     * per frame, 30 fps) after; paced at every vblank it ran at double speed.
+     * EDEN_NX2_SWAP_INTERVAL=<n> forces the interval.
+     *
+     * @param timing  Present word 12: (swap interval << 16) | refresh rate.
+     * @param process Owning process, for the Mario Kart World dynamic FPS case; may be null.
+     */
     void PaceToVblank(u32 timing, const Kernel::KProcess* process) {
         const bool trace = Common::DkbFrameTrace::Enabled();
         if (trace) {
@@ -1978,15 +1963,26 @@ private:
             m_frame_trace.refresh = refresh_rate;
             m_frame_trace.forced = forced_interval;
         }
-        if (!Settings::values.use_speed_limit.GetValue() || Settings::SpeedLimit() == 0) {
+        static const u32 forced_fps_limit = [] {
+            const char* value = std::getenv("EDEN_NX2_FPS_LIMIT");
+            return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+        }();
+        const u32 fps_limit =
+            forced_fps_limit != 0 ? forced_fps_limit : Settings::values.fps_limit.GetValue();
+        const bool speed_limited =
+            Settings::values.use_speed_limit.GetValue() && Settings::SpeedLimit() != 0;
+        if (!speed_limited && fps_limit == 0) {
             return;
         }
         if (timing != std::exchange(m_swap_word, timing)) {
-            LOG_INFO(Service, "nx2:vi2 present #{} swap interval {} at {} Hz (word 12 = {:#x})",
-                     m_presents, swap_interval, refresh_rate, timing);
+            LOG_INFO(Service,
+                     "nx2:vi2 present #{} swap interval {} at {} Hz, FPS limit {} (word 12 = {:#x})",
+                     m_presents, swap_interval, refresh_rate, fps_limit, timing);
         }
-        const auto interval = std::chrono::nanoseconds{
-            100'000'000'000LL * swap_interval / refresh_rate / Settings::SpeedLimit()};
+        const auto vblank_interval = std::chrono::nanoseconds{
+            100'000'000'000LL * swap_interval / refresh_rate /
+            (speed_limited ? Settings::SpeedLimit() : 100)};
+        const auto interval = PacedInterval(vblank_interval, fps_limit);
         if (trace) {
             m_frame_trace.target_ms = std::chrono::duration<double, std::milli>(interval).count();
         }
@@ -2651,37 +2647,6 @@ private:
         u32 value;
     };
 
-    // Ocarina shows one movie frame per game frame: skip late ones on a real clock (m_mutex held).
-    static constexpr u64 OcarinaOfTimeMovieProgramId = 0x0400486024DEC000ULL;
-    static constexpr auto MovieClockPause = std::chrono::seconds{1};
-
-    bool SyncsToClock() {
-        return system.GetApplicationProcessProgramID() == OcarinaOfTimeMovieProgramId;
-    }
-
-    bool IsLate(u64 pts) const {
-        if (!m_clock_running) {
-            return false;
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (now - m_clock_last_take > MovieClockPause) {
-            return false;
-        }
-        const auto elapsed =
-            std::chrono::duration_cast<std::chrono::microseconds>(now - m_clock_start).count();
-        const u64 due = m_clock_start_pts + static_cast<u64>((std::max<s64>)(elapsed, 0));
-        return pts + 2 * m_frame_us < due;
-    }
-
-    void EndMovieClock() {
-        if (m_late_dropped != 0) {
-            LOG_INFO(Service, "{} skipped {} late frames to keep the movie in time",
-                     GetServiceName(), m_late_dropped);
-        }
-        m_late_dropped = 0;
-        m_clock_running = false;
-    }
-
     static constexpr u32 NoSyncpoint = ~0U;
     static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
     static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
@@ -2767,8 +2732,6 @@ private:
             m_codec = std::move(codec);
             m_width = w[5];
             m_height = w[6];
-            m_frame_us = w[7] != 0 && w[7] <= 240 ? u64{1'000'000} / w[7] : u64{1'000'000} / 60;
-            m_clock_running = false;
         }
         if (!m_worker.joinable()) {
             m_worker = std::thread{[this] { DecodeLoop(); }};
@@ -2861,16 +2824,6 @@ private:
     void ReleaseBuffer(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         Log(ctx, "release output");
-        if (Common::Nx2MovieClock::Enabled() &&
-            m_last_take != std::chrono::steady_clock::time_point{}) {
-            auto& clock = Common::Nx2MovieClock::Get();
-            Common::Nx2MovieClock::Add(clock.video_releases, 1);
-            Common::Nx2MovieClock::Add(
-                clock.take_to_release_us,
-                static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
-                                     std::chrono::steady_clock::now() - m_last_take)
-                                     .count()));
-        }
         const auto handle = HandOut(w[2], Fence{~w[4], w[6]});
         TipcReplyWords(ctx, {handle[0], handle[1], handle[2], handle[3]});
     }
@@ -2964,7 +2917,6 @@ private:
                          m_decoded_frames, m_frames_out, m_stream_ended, m_end_queued);
             }
             CompleteHandedFences();
-            EndMovieClock();
         }
         TipcReplyWords(ctx, {});
     }
@@ -2995,11 +2947,6 @@ private:
             if (!m_outputs.empty()) {
                 output = m_outputs.front();
                 m_outputs.pop_front();
-                const auto now = std::chrono::steady_clock::now();
-                if (m_clock_running && now - m_clock_last_take > MovieClockPause) {
-                    m_clock_start += now - m_clock_last_take;
-                }
-                m_clock_last_take = now;
             }
         }
         if (!output) {
@@ -3011,12 +2958,6 @@ private:
             IPC::ResponseBuilder rb{ctx, 2};
             rb.PushRaw<u32>(0x1c286f);
             return;
-        }
-        if (Common::Nx2MovieClock::Enabled()) {
-            auto& clock = Common::Nx2MovieClock::Get();
-            Common::Nx2MovieClock::Add(clock.video_takes, 1);
-            clock.video_last_pts_us.store(output->pts, std::memory_order_relaxed);
-            m_last_take = std::chrono::steady_clock::now();
         }
         const u64 pts_ns = output->pts * 1000;
         if (Nx2VideoTraceEnabled()) {
@@ -3049,7 +2990,6 @@ private:
             if (m_flush) {
                 m_flush = false;
                 m_decoded.clear();
-                EndMovieClock();
                 if (decoder) {
                     lk.unlock();
                     decoder->Reset();
@@ -3058,19 +2998,8 @@ private:
                 continue;
             }
             if (!m_decoded.empty() && !m_free.empty()) {
-                while (m_decoded.size() > 1 && !m_decoded.front().end &&
-                       IsLate(m_decoded.front().pts)) {
-                    m_decoded.pop_front();
-                    ++m_late_dropped;
-                }
                 Decoded frame = std::move(m_decoded.front());
                 m_decoded.pop_front();
-                if (!m_clock_running && frame.picture && !frame.end && SyncsToClock()) {
-                    m_clock_running = true;
-                    m_clock_start = std::chrono::steady_clock::now();
-                    m_clock_last_take = m_clock_start;
-                    m_clock_start_pts = frame.pts;
-                }
                 const u32 image = m_free.front();
                 m_free.pop_front();
                 std::optional<Fence> fence;
@@ -3090,7 +3019,6 @@ private:
                     m_stream_ended = true;
                     m_end_queued = false;
                     m_ready->room.store(false, std::memory_order_relaxed);
-                    EndMovieClock();
                 }
                 system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
                 m_last_output = m_outputs.back();
@@ -3146,14 +3074,9 @@ private:
             if (m_flush) {
                 continue;
             }
-            for (size_t i = 0; i < pictures.size(); ++i) {
-                const u64 pts = pictures[i].pts;
-                const bool last = input.end && i + 1 == pictures.size();
-                if (!last && IsLate(pts)) {
-                    ++m_late_dropped;
-                    continue;
-                }
-                m_decoded.push_back({std::move(pictures[i]), pts, false});
+            for (auto& picture : pictures) {
+                const u64 pts = picture.pts;
+                m_decoded.push_back({std::move(picture), pts, false});
             }
             if (input.end) {
                 // The client stops at the frame marked end of stream; give it one even when the
@@ -3352,13 +3275,6 @@ private:
     bool m_end_queued{};
     bool m_flush{};
     bool m_quit{};
-    std::chrono::steady_clock::time_point m_last_take{};
-    u64 m_frame_us{1'000'000 / 60};
-    bool m_clock_running{};
-    std::chrono::steady_clock::time_point m_clock_start{};
-    std::chrono::steady_clock::time_point m_clock_last_take{};
-    u64 m_clock_start_pts{};
-    u64 m_late_dropped{};
     std::thread m_worker;
 };
 

@@ -29,8 +29,9 @@ TEST_CASE("Spatial cutscene replacement decodes sRGB into float without temporal
 
 TEST_CASE("DLSS recording restores inputs before each evaluation failure returns", "[dlss_contract]") {
     using EvaluationResult = VideoCommon::DlssEvaluationResult;
-    for (const auto failure : {EvaluationResult::Succeeded, EvaluationResult::OptionsFailed, EvaluationResult::TokenFailed,
-                               EvaluationResult::ConstantsFailed, EvaluationResult::EvaluateFailed}) {
+    for (const auto failure : {EvaluationResult::Succeeded, EvaluationResult::OptionsFailed,
+                               EvaluationResult::TokenFailed, EvaluationResult::ConstantsFailed,
+                               EvaluationResult::EvaluateFailed}) {
         std::vector<int> events;
         bool sampled = false;
         bool partial_output = false;
