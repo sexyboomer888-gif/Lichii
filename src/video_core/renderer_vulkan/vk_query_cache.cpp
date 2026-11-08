@@ -219,7 +219,9 @@ public:
         // Time's title screen and file select reached 16,384 slots over 64 banks, while gameplay
         // windows in Hyrule Field, Kakariko Village, and the Shooting Gallery reach up to 346
         // slots across two banks. Past 4 banks (1,024 slots), drop the count as a reset would.
-        static constexpr size_t MaxRunningQuerySlots = 4 * SamplesQueryBank::BANK_SIZE;
+        // Ocarina of Time on an RTX 5070 Ti also ran windows of 8,192 and 32,768 slots with no
+        // report (64 drops in 3 h at 32 banks); the bank pool grows on demand, so keep 128 banks.
+        static constexpr size_t MaxRunningQuerySlots = 128 * SamplesQueryBank::BANK_SIZE;
         if (current_query && current_query->size_slots > MaxRunningQuerySlots) {
             // It drops a real count. Logged on the 1st, 2nd, 4th, 8th... drop, so a window this
             // long during gameplay doesn't go unnoticed and a title screen doesn't flood the log.
