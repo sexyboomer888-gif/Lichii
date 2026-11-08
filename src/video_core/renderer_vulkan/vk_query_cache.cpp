@@ -218,8 +218,10 @@ public:
         // submission and render pass, and the query keeps every bank it touches alive. Ocarina of
         // Time's title screen and file select reached 16,384 slots over 64 banks. Gameplay near
         // water and windows can exceed a single 256-slot bank, so the limit must not trigger there:
-        // reset only when the count grows far beyond anything gameplay reaches.
-        if (current_query && current_query->size_slots > SamplesQueryBank::BANK_SIZE * 32) {
+        // reset only when the count grows far beyond anything gameplay reaches. At 32 banks
+        // (8,192 slots) Ocarina of Time still dropped a count about every three minutes in a
+        // 3 h session, and the water then vanished for a frame; 128 banks make that rarer.
+        if (current_query && current_query->size_slots > SamplesQueryBank::BANK_SIZE * 128) {
             // It drops a real count. Logged on the 1st, 2nd, 4th, 8th... drop, so a window this
             // long during gameplay doesn't go unnoticed and a title screen doesn't flood the log.
             ++bank_bound_resets;
