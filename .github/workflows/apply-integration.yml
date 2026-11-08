@@ -23,15 +23,15 @@ jobs:
           ref: fix/oot-88
           path: repo
           fetch-depth: 0
-      - name: Build 22 on upstream nx2 65e979ad
+      - name: Build 23 on upstream nx2 bf4c42e2
         working-directory: repo
         run: |
           set -eux
           git config user.name "github-actions[bot]"
           git config user.email "41898732+github-actions[bot]@users.noreply.github.com"
-          test "$(git rev-parse HEAD)" = f3523bbf2638d916447891b58eaf69d9f94ec831
+          test "$(git rev-parse HEAD)" = 9332714a3098ba8a4b468a9c66ed0e85858365f3
           git update-ref refs/heads/fork_tip HEAD
-          bash ../ci/build22.sh
-          test "$(git rev-parse 'HEAD^{tree}')" = 8c210377bb643fbf40e853cbda4af65fa8833544
-          git merge-base --is-ancestor f3523bbf2638d916447891b58eaf69d9f94ec831 HEAD
+          bash ../ci/build23.sh
+          test "$(git rev-parse 'HEAD^{tree}')" = 0314929a516cc2108afd1f0bbe063151c0b3f014
+          git merge-base --is-ancestor 9332714a3098ba8a4b468a9c66ed0e85858365f3 HEAD
           git push origin HEAD:fix/oot-88
