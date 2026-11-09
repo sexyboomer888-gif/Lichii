@@ -45,6 +45,11 @@
 #include "util/util.h"
 #include "yuzu/game/game_list.h"
 #include "yuzu/nup_dialogs.h"
+#include "yuzu/shader_warm_dialog.h"
+#include "video_core/shader_warm/shader_warm_builder.h"
+#ifdef LICHII_NX_TOOLS
+#include "yuzu/nx_tools.h"
+#endif
 
 #include "applets/qt_amiibo_settings.h"
 #include "applets/qt_controller.h"
@@ -1076,7 +1081,8 @@ void MainWindow::InitializeWidgets() {
             [this](const QPoint& menu_location) {
                 QMenu context_menu;
                 for (auto const& [type, text] : ConfigurationShared::frame_gen_type_texts_map) {
-                    context_menu.addAction(text, [this, type] {
+                    const QString label = ConfigurationShared::TranslateMapText(translator, text);
+                    context_menu.addAction(label, [this, type] {
                         Settings::values.frame_gen_type.SetValue(type);
                         Settings::values.frame_gen.SetValue(true);
                         UpdateFrameGenButton();
@@ -1143,7 +1149,9 @@ void MainWindow::InitializeWidgets() {
             [this](const QPoint& menu_location) {
                 QMenu context_menu;
                 for (auto const& aa_text_pair : ConfigurationShared::anti_aliasing_texts_map) {
-                    context_menu.addAction(aa_text_pair.second, [this, aa_text_pair] {
+                    const QString label =
+                        ConfigurationShared::TranslateMapText(translator, aa_text_pair.second);
+                    context_menu.addAction(label, [this, aa_text_pair] {
                         Settings::values.anti_aliasing.SetValue(aa_text_pair.first);
                         UpdateAAText();
                     });
@@ -1166,7 +1174,9 @@ void MainWindow::InitializeWidgets() {
             [this](const QPoint& menu_location) {
                 QMenu context_menu;
                 for (auto const& filter_text_pair : ConfigurationShared::scaling_filter_texts_map) {
-                    context_menu.addAction(filter_text_pair.second, [this, filter_text_pair] {
+                    const QString label =
+                        ConfigurationShared::TranslateMapText(translator, filter_text_pair.second);
+                    context_menu.addAction(label, [this, filter_text_pair] {
                         Settings::values.scaling_filter.SetValue(filter_text_pair.first);
                         UpdateFilterText();
                     });
@@ -1189,7 +1199,9 @@ void MainWindow::InitializeWidgets() {
                 QMenu context_menu;
 
                 for (auto const& pair : ConfigurationShared::use_docked_mode_texts_map) {
-                    context_menu.addAction(pair.second, [this, &pair] {
+                    const QString label =
+                        ConfigurationShared::TranslateMapText(translator, pair.second);
+                    context_menu.addAction(label, [this, &pair] {
                         if (pair.first != Settings::values.use_docked_mode.GetValue()) {
                             OnToggleDockedMode();
                         }
@@ -1213,7 +1225,9 @@ void MainWindow::InitializeWidgets() {
                 QMenu context_menu;
 
                 for (auto const& gpu_accuracy_pair : ConfigurationShared::gpu_accuracy_texts_map) {
-                    context_menu.addAction(gpu_accuracy_pair.second, [this, gpu_accuracy_pair] {
+                    const QString label =
+                        ConfigurationShared::TranslateMapText(translator, gpu_accuracy_pair.second);
+                    context_menu.addAction(label, [this, gpu_accuracy_pair] {
                         Settings::values.gpu_accuracy.SetValue(gpu_accuracy_pair.first);
                         UpdateGPUAccuracyButton();
                     });
@@ -1243,11 +1257,12 @@ void MainWindow::InitializeWidgets() {
                     if (renderer_backend_pair.first == Settings::RendererBackend::Null) {
                         continue;
                     }
-                    context_menu.addAction(
-                        renderer_backend_pair.second, [this, renderer_backend_pair] {
-                            Settings::values.renderer_backend.SetValue(renderer_backend_pair.first);
-                            UpdateAPIText();
-                        });
+                    const QString label = ConfigurationShared::TranslateMapText(
+                        translator, renderer_backend_pair.second);
+                    context_menu.addAction(label, [this, renderer_backend_pair] {
+                        Settings::values.renderer_backend.SetValue(renderer_backend_pair.first);
+                        UpdateAPIText();
+                    });
                 }
                 context_menu.exec(renderer_status_button->mapToGlobal(menu_location));
                 renderer_status_button->repaint();
@@ -1504,9 +1519,26 @@ void MainWindow::ConnectWidgetEvents() {
             &MainWindow::OnGameListVerifyIntegrity);
     connect(game_list, &GameList::ConvertToNupRequested, this,
             &MainWindow::OnGameListConvertToNup);
+    connect(game_list, &GameList::PrepareShaderWarmRequested, this,
+            &MainWindow::OnGameListPrepareShaderWarm);
+    connect(game_list, &GameList::DeleteShaderWarmRequested, this,
+            &MainWindow::OnGameListDeleteShaderWarm);
     connect(game_list, &GameList::ExtractNupRequested, this, &MainWindow::OnGameListExtractNup);
     connect(game_list, &GameList::EditNupMetadataRequested, this,
             &MainWindow::OnGameListEditNupMetadata);
+#ifdef LICHII_NX_TOOLS
+    nx_tools = new NxTools(QtCommon::vfs, this);
+    connect(nx_tools, &NxTools::RunningChanged, game_list, &GameList::SetNxToolRunning);
+    connect(nx_tools, &NxTools::ArchivesChanged, this, &MainWindow::OnGameListRefresh);
+    connect(game_list, &GameList::ConvertToNxRequested, this,
+            [this](const std::string& path) { OnGameListNxTool(path, &NxTools::ConvertToNx); });
+    connect(game_list, &GameList::AddToNxRequested, this,
+            [this](const std::string& path) { OnGameListNxTool(path, &NxTools::AddToNx); });
+    connect(game_list, &GameList::RemoveFromNxRequested, this,
+            [this](const std::string& path) { OnGameListNxTool(path, &NxTools::RemoveFromNx); });
+    connect(game_list, &GameList::EditNxMetadataRequested, this,
+            [this](const std::string& path) { OnGameListNxTool(path, &NxTools::EditNxMetadata); });
+#endif
     connect(game_list, &GameList::CopyTIDRequested, this, &MainWindow::OnGameListCopyTID);
     connect(game_list, &GameList::CreateShortcut, this, &MainWindow::OnGameListCreateShortcut);
     connect(game_list, &GameList::AddDirectory, this, &MainWindow::OnGameListAddDirectory);
@@ -2010,6 +2042,14 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
                                     "converted."));
         return;
     }
+    if (shader_warm_dialog && shader_warm_dialog->IsRunning()) {
+        QMessageBox::information(this, tr("Shader Precache in Progress"),
+                                 tr("Games cannot be started while the shader precache is being "
+                                    "built. Wait for it to finish or cancel it."));
+        shader_warm_dialog->raise();
+        shader_warm_dialog->activateWindow();
+        return;
+    }
     if (boot_in_progress || close_pending) {
         return;
     }
@@ -2091,6 +2131,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         Settings::UpdateGPUAccuracy();
         LOG_INFO(Config, "Applied recommended MKW settings after per-game configuration");
     }
+    PrepareShaderPrecache(title_id, std::filesystem::path{filename.toStdU16String()});
     Settings::LogSettings();
 
     if (UISettings::values.select_user_on_boot && !user_flag_cmd_line) {
@@ -4282,6 +4323,20 @@ void MainWindow::OnGameListRefresh() {
     SetFirmwareVersion();
 }
 
+#ifdef LICHII_NX_TOOLS
+void MainWindow::OnGameListNxTool(const std::string& game_path,
+                                  void (NxTools::*tool)(const std::string&)) {
+    // An archive edited in place must not be read by a running game.
+    if (emulation_running && tool != &NxTools::ConvertToNx &&
+        current_game_path == QString::fromStdString(game_path)) {
+        QMessageBox::information(this, tr("NX Archive"),
+                                 tr("Stop the game before changing its NX archive."));
+        return;
+    }
+    (nx_tools->*tool)(game_path);
+}
+#endif
+
 void MainWindow::OnGameListConvertToNup(const std::string& game_path) {
     if (nup_running)
         return;
@@ -4403,6 +4458,132 @@ void MainWindow::OnGameListConvertToNup(const std::string& game_path) {
             Qt::QueuedConnection);
         return result;
     }));
+}
+
+namespace {
+/// The game's title as its loader reports it, else the file name without extension.
+QString GameTitleName(const std::string& game_path) {
+    if (const auto loader = Loader::GetLoader(
+            *QtCommon::system, QtCommon::vfs->OpenFile(game_path, FileSys::OpenMode::Read))) {
+        std::string title;
+        if (loader->ReadTitle(title) == Loader::ResultStatus::Success) {
+            return QString::fromStdString(title);
+        }
+    }
+    return QFileInfo(QString::fromStdString(game_path)).completeBaseName();
+}
+} // namespace
+
+/// Opens the shader precache dialog for the game and starts the build, or brings a running one to
+/// the front. Refused while a game runs or while this game is being converted.
+void MainWindow::OnGameListPrepareShaderWarm(u64 program_id, const std::string& game_path) {
+    if (shader_warm_dialog) {
+        if (shader_warm_dialog->IsRunning()) {
+            shader_warm_dialog->raise();
+            shader_warm_dialog->activateWindow();
+            return;
+        }
+        shader_warm_dialog->close();
+    }
+    if (QtCommon::emu_thread != nullptr) {
+        QMessageBox::information(this, tr("Precache Shaders"),
+                                 tr("Close the running game first."));
+        return;
+    }
+    if (nup_running && game_path == nup_source_path) {
+        QMessageBox::information(this, tr("Precache Shaders"),
+                                 tr("This game is being converted. Try again when it is done."));
+        return;
+    }
+
+    const auto path = std::filesystem::path{std::u8string{game_path.begin(), game_path.end()}};
+    shader_warm_dialog =
+        new ShaderWarmDialog(*QtCommon::system, path, program_id, GameTitleName(game_path), this);
+    connect(shader_warm_dialog, &QDialog::finished, shader_warm_dialog, &QObject::deleteLater);
+    shader_warm_dialog->show();
+    shader_warm_dialog->Start();
+}
+
+/// With precache_shaders on: a title precached before is precached again only when the driver or
+/// its precache file changed (the renderer checks). For one never precached, Ask asks whether to
+/// precache before the game starts, and a title without a precache file gets one built from its
+/// game files first. A stopped or failed build starts the game without precaching.
+void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path& game_path) {
+    namespace ShaderWarm = VideoCommon::ShaderWarm;
+    ShaderWarm::RequestWarmBeforeStart(false);
+    const auto mode = Settings::values.precache_shaders.GetValue();
+    // The precache runs where the disk shader cache loads.
+    if (title_id == 0 || mode == Settings::PrecacheShaders::Off ||
+        !Settings::values.use_disk_shader_cache.GetValue()) {
+        return;
+    }
+    if (!ShaderWarm::WarmPending(title_id)) {
+        // Precached before: the renderer runs it again only when the driver or the file changed.
+        ShaderWarm::RequestWarmBeforeStart(true);
+        return;
+    }
+    if (mode == Settings::PrecacheShaders::Ask) {
+        QMessageBox box(QMessageBox::Question, tr("Precache Shaders"),
+                        tr("The shaders of this game are not precached yet. Precache them now?\n\n"
+                           "The game starts when they are done. The first time, the game files "
+                           "are read and their shaders are built on every CPU thread, with the "
+                           "shaders earlier play sessions saved, which takes a few minutes. Later "
+                           "launches only build what is new, until the GPU driver changes. The "
+                           "loading screen has a Skip button.\n\n"
+                           "You can change this in Configure, Graphics, Advanced."),
+                        QMessageBox::NoButton, this);
+        QPushButton* const precache = box.addButton(tr("Precache now"), QMessageBox::AcceptRole);
+        box.addButton(tr("Start without"), QMessageBox::RejectRole);
+        box.setDefaultButton(precache);
+        box.exec();
+        const bool now = box.clickedButton() == precache;
+        LOG_INFO(Frontend, "Shader precache before the game starts: {}", now ? "yes" : "no");
+        if (!now) {
+            return;
+        }
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(ShaderWarm::ComputeWarmPath(title_id), ec)) {
+        ShaderWarmDialog dialog(*QtCommon::system, game_path, title_id,
+                                GameTitleName(Common::FS::PathToUTF8String(game_path)), this);
+        connect(&dialog, &ShaderWarmDialog::BuildFinished, &dialog, [&dialog](bool ok) {
+            if (ok) {
+                dialog.accept();
+            }
+        });
+        dialog.Start();
+        dialog.exec();
+        if (!std::filesystem::exists(ShaderWarm::ComputeWarmPath(title_id), ec)) {
+            return;
+        }
+    }
+    ShaderWarm::RequestWarmBeforeStart(true);
+}
+
+/// Deletes the game's precache files after a confirmation, showing the error when it fails.
+void MainWindow::OnGameListDeleteShaderWarm(u64 program_id) {
+    if (shader_warm_dialog && shader_warm_dialog->IsRunning() &&
+        shader_warm_dialog->TitleId() == program_id) {
+        // The builder writes this title's files: deleting them under it would lose the result or
+        // fail it. Other titles' files are in their own folders.
+        QMessageBox::information(this, tr("Delete Shader Precache"),
+                                 tr("Shaders are being precached. Try again when it is done."));
+        shader_warm_dialog->raise();
+        shader_warm_dialog->activateWindow();
+        return;
+    }
+    if (QMessageBox::question(this, tr("Delete Shader Precache"),
+                              tr("Delete the shader precache files of this game? They are built "
+                                 "again the next time the game is precached."),
+                              QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) {
+        return;
+    }
+    std::string error;
+    if (!DeleteShaderWarmFiles(program_id, error)) {
+        QMessageBox::critical(this, tr("Delete Shader Precache"),
+                              tr("The files could not be deleted: %1")
+                                  .arg(QString::fromStdString(error)));
+    }
 }
 
 void MainWindow::OnGameListExtractNup(const std::string& game_path) {
@@ -4949,8 +5130,8 @@ void MainWindow::UpdateStatusBar() {
 
 void MainWindow::UpdateGPUAccuracyButton() {
     const auto gpu_accuracy = Settings::values.gpu_accuracy.GetValue();
-    const auto gpu_accuracy_text =
-        ConfigurationShared::gpu_accuracy_texts_map.find(gpu_accuracy)->second;
+    const auto gpu_accuracy_text = ConfigurationShared::TranslateMapText(
+        translator, ConfigurationShared::gpu_accuracy_texts_map.find(gpu_accuracy)->second);
     gpu_accuracy_button->setText(gpu_accuracy_text.toUpper());
     gpu_accuracy_button->setChecked(gpu_accuracy != Settings::GpuAccuracy::Low);
 }
@@ -4958,29 +5139,31 @@ void MainWindow::UpdateGPUAccuracyButton() {
 void MainWindow::UpdateDockedButton() {
     const auto console_mode = Settings::values.use_docked_mode.GetValue();
     dock_status_button->setChecked(Settings::IsDockedMode());
-    dock_status_button->setText(
-        ConfigurationShared::use_docked_mode_texts_map.find(console_mode)->second.toUpper());
+    const QString docked_text = ConfigurationShared::TranslateMapText(
+        translator, ConfigurationShared::use_docked_mode_texts_map.find(console_mode)->second);
+    dock_status_button->setText(docked_text.toUpper());
 }
 
 void MainWindow::UpdateAPIText() {
     const auto api = Settings::values.renderer_backend.GetValue();
-    const auto renderer_status_text =
-        ConfigurationShared::renderer_backend_texts_map.find(api)->second;
+    const auto renderer_status_text = ConfigurationShared::TranslateMapText(
+        translator, ConfigurationShared::renderer_backend_texts_map.find(api)->second);
     renderer_status_button->setText(renderer_status_text.toUpper());
 }
 
 void MainWindow::UpdateFilterText() {
     const auto filter = Settings::values.scaling_filter.GetValue();
-    const auto filter_text = ConfigurationShared::scaling_filter_texts_map.find(filter)->second;
+    const auto filter_text = ConfigurationShared::TranslateMapText(
+        translator, ConfigurationShared::scaling_filter_texts_map.find(filter)->second);
     filter_status_button->setText(filter_text.toUpper());
 }
 
 void MainWindow::UpdateAAText() {
     const auto aa_mode = Settings::values.anti_aliasing.GetValue();
-    const auto aa_text = ConfigurationShared::anti_aliasing_texts_map.find(aa_mode)->second;
-    aa_status_button->setText(aa_mode == Settings::AntiAliasing::None
-                                  ? QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "NO AA"))
-                                  : aa_text.toUpper());
+    const auto aa_text = ConfigurationShared::TranslateMapText(
+        translator, ConfigurationShared::anti_aliasing_texts_map.find(aa_mode)->second);
+    aa_status_button->setText(aa_mode == Settings::AntiAliasing::None ? tr("NO AA")
+                                                                      : aa_text.toUpper());
 }
 
 #ifdef HAS_RESHADE
@@ -5012,9 +5195,10 @@ void MainWindow::UpdateFrameGenButton() {
         return;
     }
 
-    const QString type = ConfigurationShared::frame_gen_type_texts_map
-                             .find(Settings::values.frame_gen_type.GetValue())
-                             ->second.toUpper();
+    const QString& type_text = ConfigurationShared::frame_gen_type_texts_map
+                                   .find(Settings::values.frame_gen_type.GetValue())
+                                   ->second;
+    const QString type = ConfigurationShared::TranslateMapText(translator, type_text).toUpper();
     const u32 target_rate = Settings::values.frame_gen_target_rate.GetValue();
     const QString mode = target_rate == 0
                              ? tr("FG %1 %2X").arg(type).arg(Settings::FrameGenMultiplier())
@@ -5540,35 +5724,49 @@ void MainWindow::UpdateUITheme() {
 void MainWindow::LoadTranslation() {
     bool loaded;
 
-    if (UISettings::values.language.GetValue().empty()) {
+    const std::string language = UISettings::values.language.GetValue();
+    if (language.empty()) {
         // If the selected language is empty, use system locale
         loaded = translator.load(QLocale(), {}, {}, QStringLiteral(":/languages/"));
     } else {
         // Otherwise load from the specified file
-        loaded = translator.load(QString::fromStdString(UISettings::values.language.GetValue()),
-                                 QStringLiteral(":/languages/"));
+        loaded = translator.load(QString::fromStdString(language), QStringLiteral(":/languages/"));
     }
 
-    if (loaded)
+    if (loaded) {
         qApp->installTranslator(&translator);
-    else
-        UISettings::values.language = std::string("en");
+    } else if (!language.empty() && language != "en") {
+        // A language this build has no translation for shows English, but the setting is kept
+        // (the language list marks it as missing), so a build that has the translation shows it
+        // again. Likewise <System> stays when the system's language has no translation. English
+        // works without its file (en.qm only holds plurals, and builds without translations lack
+        // it), so it gets no warning.
+        LOG_WARNING(Frontend, "No UI translation for \"{}\" in this build, showing English",
+                    language);
+    }
 }
 
 void MainWindow::OnLanguageChanged(const QString& locale) {
     if (UISettings::values.language.GetValue() != std::string("en"))
         qApp->removeTranslator(&translator);
 
+    UISettings::values.language = locale.toStdString();
+    LoadTranslation();
+
+    // After the new translator is in: renamed before it, the sizes stayed in English.
     QList<QAction*> actions = game_size_actions->actions();
     for (size_t i = 0; i < default_game_icon_sizes.size(); i++) {
         actions.at(i)->setText(GetTranslatedGameIconSize(i));
     }
 
-    UISettings::values.language = locale.toStdString();
-    LoadTranslation();
     ui->retranslateUi(this);
     multiplayer_state->retranslateUi();
     UpdateWindowTitle();
+    // The status bar's buttons are named in code, so retranslateUi leaves them as they were.
+    UpdateStatusButtons();
+#ifdef HAS_RESHADE
+    UpdatePostShaderText();
+#endif
 }
 
 void MainWindow::SetDiscordEnabled([[maybe_unused]] bool state) {
