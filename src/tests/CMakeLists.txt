@@ -16,6 +16,7 @@ add_executable(tests
     video_core/host_mip_limits.cpp
     video_core/gpu_timestamp.cpp
     video_core/semaphore_waiters.cpp
+    video_core/unbacked_image_policy.cpp
     core/nx2_streamplay.cpp
     core/nx2_video_ready.cpp
     core/nx2_debug_server.cpp
@@ -83,6 +84,7 @@ add_executable(tests
     video_core/async_shader_emission.cpp
     video_core/oot_network.cpp
     video_core/page_filter.cpp
+    video_core/pipeline_eviction_policy.cpp
     video_core/pipeline_optimization.cpp
     video_core/spirv_atomic_retry.cpp
     video_core/spirv_storage_alignment.cpp
